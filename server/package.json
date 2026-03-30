@@ -1,0 +1,16 @@
+{
+  "name": "two-way-call-server",
+  "version": "1.0.0",
+  "description": "Mediasoup server for two-way audio",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "mediasoup": "^3.19.19",
+    "socket.io": "^4.8.3"
+  }
+}
