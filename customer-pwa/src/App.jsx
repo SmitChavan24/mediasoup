@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupCall } from './lib/mediasoupClient';
 
-const SERVER_URL = 'http://localhost:3000';
+const SERVER_URL = 'https://lyrically-unregretting-michel.ngrok-free.dev';
 
 function App() {
   const [username, setUsername] = useState('');
@@ -12,7 +12,7 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [activeCall, setActiveCall] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
-  
+
   // Roster state
   const [activeAgents, setActiveAgents] = useState([]);
 
@@ -28,7 +28,11 @@ function App() {
 
   const connectSocket = () => {
     const s = io(SERVER_URL, {
-      query: { role: 'customer', username: username.trim() }
+      query: { role: 'customer', username: username.trim() },
+      transports: ['websocket', 'polling'],
+      extraHeaders: {
+        'ngrok-skip-browser-warning': 'true'
+      }
     });
 
     s.on('connect', () => {
@@ -67,12 +71,12 @@ function App() {
 
   const callAnyAgent = () => {
     setActiveCall({ state: 'Waiting for an agent...', withUser: 'Next Available' });
-    
+
     socket.emit('callIn');
 
     socket.once('callAccepted', async ({ callId }) => {
       setActiveCall({ callId, state: 'Connected', withUser: 'Agent' });
-      
+
       try {
         const callTransports = await setupCall(socket, callId, () => {
           console.log('Playing remote audio');
@@ -88,10 +92,10 @@ function App() {
   const callSpecificAgent = (agentId, agentName) => {
     socket.emit('dialOut', { targetId: agentId }, (res) => {
       if (res.error) return alert(res.error);
-      
+
       const { callId } = res;
       setActiveCall({ callId, withUser: agentName, state: 'Calling...' });
-      
+
       socket.once('callAccepted', async () => {
         setActiveCall({ callId, withUser: agentName, state: 'Connected' });
         try {
@@ -113,7 +117,7 @@ function App() {
 
     socket.emit('acceptCall', { callId }, async (res) => {
       if (res.error) return alert(res.error);
-      
+
       setActiveCall({ callId, state: 'Connected', withUser: from });
       setIncomingCall(null);
 
@@ -140,12 +144,12 @@ function App() {
         <form onSubmit={handleLogin} className="login-box">
           <h2>Customer Login</h2>
           <p>Please enter your name to connect</p>
-          <input 
-            type="text" 
-            placeholder="Your Name" 
-            value={username} 
+          <input
+            type="text"
+            placeholder="Your Name"
+            value={username}
             onChange={e => setUsername(e.target.value)}
-            autoFocus 
+            autoFocus
             required
           />
           <button type="submit">Connect to System</button>
@@ -182,8 +186,8 @@ function App() {
           {!incomingCall && (
             <>
               <div className="card" style={{ textAlign: 'center', padding: '24px 24px' }}>
-                <button 
-                  className="success" 
+                <button
+                  className="success"
                   style={{ width: '100%', padding: '16px', fontSize: '18px', borderRadius: '16px', marginBottom: '8px' }}
                   onClick={callAnyAgent}
                 >
