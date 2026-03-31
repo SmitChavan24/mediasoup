@@ -21,7 +21,7 @@ const activeUsers = new Map();
 function broadcastPresence() {
   const agents = [];
   const customers = [];
-  
+
   for (const [id, user] of activeUsers.entries()) {
     if (user.role === 'agent') {
       agents.push(user);
@@ -38,23 +38,23 @@ async function main() {
   await startMediasoup();
 
   io.on('connection', (socket) => {
-    const { role, username } = socket.handshake.query; 
+    const { role, username } = socket.handshake.query;
 
     if (role && username) {
       console.log(`[${role}] connected: ${username} (${socket.id})`);
-      
+
       activeUsers.set(socket.id, {
         id: socket.id,
         username,
         role
       });
-      
+
       if (role === 'agent') {
         socket.join('agents');
       } else if (role === 'customer') {
         socket.join('customers');
       }
-      
+
       broadcastPresence();
     }
 
@@ -119,9 +119,9 @@ async function main() {
       });
       socket._consumer = consumer;
       cb({
-        id:            consumer.id,
+        id: consumer.id,
         producerId,
-        kind:          consumer.kind,
+        kind: consumer.kind,
         rtpParameters: consumer.rtpParameters,
       });
     });
@@ -132,11 +132,11 @@ async function main() {
     socket.on('dialOut', ({ targetId }, cb) => {
       const callId = `call_${Date.now()}`;
       const targetSocket = io.sockets.sockets.get(targetId);
-      
+
       if (!targetSocket) return cb({ error: 'Target user not found or offline.' });
 
       const callerUser = activeUsers.get(socket.id);
-      
+
       // Assume the caller is agent and target is customer by default,
       // but flip it if the caller is the customer.
       if (callerUser.role === 'customer') {
@@ -144,18 +144,18 @@ async function main() {
       } else {
         calls[callId] = { agentSocket: socket, customerSocket: targetSocket };
       }
-      
+
       socket._callId = callId;
       targetSocket._callId = callId;
 
       console.log(`[dialOut] ${callerUser.username} is dialing target ${targetId}`);
 
-      targetSocket.emit('incomingCall', { 
-        callId, 
+      targetSocket.emit('incomingCall', {
+        callId,
         from: callerUser.username,
-        role: callerUser.role 
+        role: callerUser.role
       });
-      
+
       cb({ callId });
     });
 
@@ -164,13 +164,13 @@ async function main() {
       const callId = `call_${Date.now()}`;
       calls[callId] = { customerSocket: socket, agentSocket: null };
       socket._callId = callId;
-      
+
       const callerUser = activeUsers.get(socket.id);
       console.log(`[callIn] General queue call from: ${callerUser.username}`);
 
       // Notify all agents
-      io.to('agents').emit('incomingCall', { 
-        callId, 
+      io.to('agents').emit('incomingCall', {
+        callId,
         from: callerUser.username,
         role: 'customer'
       });
@@ -180,19 +180,19 @@ async function main() {
     socket.on('acceptCall', ({ callId }, cb) => {
       const call = calls[callId];
       if (!call) return cb({ error: 'Call not found or ended' });
-      
+
       // If this was a general 'callIn' and the agent is answering, assign the agent socket
       if (role === 'agent' && !call.agentSocket) {
         call.agentSocket = socket;
         socket._callId = callId;
       }
-      
+
       console.log(`[acceptCall] Subscribed to call ${callId}`);
 
       // Tell the other party to start setupCall too
       const other = socket === call.agentSocket ? call.customerSocket : call.agentSocket;
       other?.emit('callAccepted', { callId });
-      
+
       cb({ callId });
     });
 
@@ -209,7 +209,7 @@ async function main() {
 
     // ── HANGUP ────────────────────────────────────────────────────────────
     socket.on('hangup', () => endCall(socket));
-    
+
     socket.on('disconnect', () => {
       endCall(socket);
       if (activeUsers.has(socket.id)) {
@@ -230,7 +230,7 @@ async function main() {
     // Notify the other party
     const other = socket === call.agentSocket ? call.customerSocket : call.agentSocket;
     other?.emit('callEnded');
-    
+
     // Unbind call IDs
     if (call.agentSocket) call.agentSocket._callId = null;
     if (call.customerSocket) call.customerSocket._callId = null;
@@ -240,7 +240,7 @@ async function main() {
     socket._consumer?.close();
     socket._sendTransport?.close();
     socket._recvTransport?.close();
-    
+
     // Clean up mediasoup resources for other
     if (other) {
       other._producer?.close();
@@ -252,6 +252,10 @@ async function main() {
     delete calls[callId];
   }
 
+  app.get('/', (req, res) => {
+    console.log("asdasdas")
+    res.json({ message: 'Hello, World!' });
+  });
   server.listen(3000, () => console.log('Server running on port 3000'));
 }
 
