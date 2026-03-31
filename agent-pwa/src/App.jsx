@@ -2,20 +2,20 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupCall } from './lib/mediasoupClient';
 
-const SERVER_URL = 'http://localhost:3000';
+const SERVER_URL = 'https://lyrically-unregretting-michel.ngrok-free.dev';
 
 function App() {
   const [username, setUsername] = useState('');
   const [loggedIn, setLoggedIn] = useState(false);
-  
+
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
   const [incomingCall, setIncomingCall] = useState(null);
   const [activeCall, setActiveCall] = useState(null);
-  
+
   // Roster state
   const [activeCustomers, setActiveCustomers] = useState([]);
-  
+
   const callRef = useRef(null);
 
   const handleLogin = (e) => {
@@ -28,7 +28,11 @@ function App() {
 
   const connectSocket = () => {
     const s = io(SERVER_URL, {
-      query: { role: 'agent', username: username.trim() }
+      query: { role: 'agent', username: username.trim() },
+      transports: ['websocket', 'polling'],
+      extraHeaders: {
+        'ngrok-skip-browser-warning': 'true'
+      }
     });
 
     s.on('connect', () => {
@@ -76,7 +80,7 @@ function App() {
       }
       setActiveCall({ callId, withUser: from, state: 'Connected' });
       setIncomingCall(null);
-      
+
       try {
         const callTransports = await setupCall(socket, callId, () => {
           console.log('Remote audio playing');
@@ -92,10 +96,10 @@ function App() {
   const dialCustomer = (customerId, customerName) => {
     socket.emit('dialOut', { targetId: customerId }, (res) => {
       if (res.error) return alert(res.error);
-      
+
       const { callId } = res;
       setActiveCall({ callId, withUser: customerName, state: 'Calling...' });
-      
+
       socket.once('callAccepted', async () => {
         setActiveCall({ callId, withUser: customerName, state: 'Connected' });
         try {
@@ -122,12 +126,12 @@ function App() {
         <form onSubmit={handleLogin} className="login-box">
           <h2>Agent Login</h2>
           <p>Please enter your name to connect</p>
-          <input 
-            type="text" 
-            placeholder="Agent Name" 
-            value={username} 
+          <input
+            type="text"
+            placeholder="Agent Name"
+            value={username}
             onChange={e => setUsername(e.target.value)}
-            autoFocus 
+            autoFocus
             required
           />
           <button type="submit">Join Support Queue</button>
