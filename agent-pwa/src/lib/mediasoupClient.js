@@ -38,17 +38,6 @@ export async function setupCall(socket, callId, onRemoteAudio) {
     });
   });
 
-  // Get mic audio and produce
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const track = stream.getAudioTracks()[0];
-    await sendTransport.produce({ track });
-  } catch (err) {
-    console.error('Failed to get media devices:', err);
-    throw err;
-  }
-
   // When the other party's producer is ready, consume it
   socket.on('newProducer', async ({ producerId }) => {
     const consumerParams = await new Promise(res =>
@@ -76,9 +65,21 @@ export async function setupCall(socket, callId, onRemoteAudio) {
     }
   });
 
+  // Get mic audio and produce
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const track = stream.getAudioTracks()[0];
+    await sendTransport.produce({ track });
+  } catch (err) {
+    console.error('Failed to get media devices:', err);
+    throw err;
+  }
+
   return { sendTransport, recvTransport, close: () => {
     stream?.getTracks().forEach(track => track.stop());
     sendTransport.close();
     recvTransport.close();
+    socket.off('newProducer');
   } };
 }

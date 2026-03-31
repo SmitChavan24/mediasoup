@@ -1,4 +1,17 @@
+const os = require('os');
 const mediasoup = require('mediasoup');
+
+function getLocalIp() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return '127.0.0.1';
+}
 
 const mediaCodecs = [
   {
@@ -10,7 +23,7 @@ const mediaCodecs = [
 ];
 
 const transportOptions = {
-  listenIps: [{ ip: '0.0.0.0', announcedIp: '127.0.0.1' }],
+  listenIps: [{ ip: '0.0.0.0', announcedIp: process.env.PUBLIC_IP || getLocalIp() }],
   enableUdp: true,
   enableTcp: true,
   preferUdp: true,
