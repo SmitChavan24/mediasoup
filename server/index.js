@@ -79,28 +79,54 @@ async function main() {
 
     // ── STEP 4: Connect send transport (DTLS handshake) ───────────────────
     socket.on('connectSendTransport', async ({ dtlsParameters }, cb) => {
+      if (!socket._sendTransport) return cb({ error: 'Send transport not found' });
       await socket._sendTransport.connect({ dtlsParameters });
       cb();
     });
 
     // ── STEP 5: Connect recv transport ────────────────────────────────────
     socket.on('connectRecvTransport', async ({ dtlsParameters }, cb) => {
+      if (!socket._recvTransport) return cb({ error: 'Recv transport not found' });
       await socket._recvTransport.connect({ dtlsParameters });
       cb();
     });
 
     // ── STEP 6: Client starts producing audio ─────────────────────────────
     socket.on('produce', async ({ kind, rtpParameters, callId }, cb) => {
+      if (!socket._sendTransport) return cb({ error: 'Send transport not found' });
       const producer = await socket._sendTransport.produce({ kind, rtpParameters });
       socket._producer = producer;
 
       const call = calls[callId];
       if (!call) return cb({ error: 'Call not found' });
 
+      // Store producer ID in the call state for monitoring
+      if (role === 'agent') {
+        call.agentProducerId = producer.id;
+      } else if (role === 'customer') {
+        call.customerProducerId = producer.id;
+      } else if (role === 'admin') {
+        // Admin whisper producer
+        call.adminWhisperProducerId = producer.id;
+      }
+
       // Tell the other party to consume this new producer
       const otherSocket = role === 'agent' ? call.customerSocket : call.agentSocket;
-      if (otherSocket) {
+      if (otherSocket && role !== 'admin') {
         otherSocket.emit('newProducer', { producerId: producer.id });
+      }
+
+      // If an admin starts whispering, tell the agent specifically
+      if (role === 'admin' && call.agentSocket) {
+        call.agentSocket.emit('newProducer', { producerId: producer.id, isWhisper: true });
+      }
+
+      // If an admin is already monitoring, notify them of new producers in the call
+      if (call.adminSocket && role !== 'admin') {
+        call.adminSocket.emit('newProducer', { 
+          producerId: producer.id, 
+          role: role // Tell admin who this producer is
+        });
       }
 
       cb({ id: producer.id });
@@ -108,6 +134,7 @@ async function main() {
 
     // ── STEP 7: Other party consumes the producer ─────────────────────────
     socket.on('consume', async ({ producerId, rtpCapabilities, callId }, cb) => {
+      if (!socket._recvTransport) return cb({ error: 'Recv transport not found' });
       const router = getRouter();
       if (!router.canConsume({ producerId, rtpCapabilities })) {
         return cb({ error: 'Cannot consume' });
@@ -123,6 +150,33 @@ async function main() {
         producerId,
         kind: consumer.kind,
         rtpParameters: consumer.rtpParameters,
+      });
+    });
+
+    // ── ADMIN MONITORING ─────────────────────────────────────────────────
+    socket.on('getLiveCalls', (cb) => {
+      const liveCalls = Object.entries(calls)
+        .filter(([_, call]) => call.agentSocket && call.customerSocket)
+        .map(([id, call]) => ({
+          id,
+          agent: activeUsers.get(call.agentSocket.id)?.username,
+          customer: activeUsers.get(call.customerSocket.id)?.username,
+          agentProducerId: call.agentProducerId,
+          customerProducerId: call.customerProducerId
+        }));
+      cb(liveCalls);
+    });
+
+    socket.on('monitorCall', ({ callId }, cb) => {
+      const call = calls[callId];
+      if (!call) return cb({ error: 'Call not found' });
+
+      call.adminSocket = socket;
+      socket._callId = callId;
+
+      cb({
+        agentProducerId: call.agentProducerId,
+        customerProducerId: call.customerProducerId
       });
     });
 
@@ -249,13 +303,23 @@ async function main() {
       other._recvTransport?.close();
     }
 
+    // Clean up for admin if monitoring
+    if (call.adminSocket) {
+      call.adminSocket.emit('callEnded');
+      call.adminSocket._callId = null;
+      call.adminSocket._producer?.close();
+      call.adminSocket._consumer?.close();
+      call.adminSocket._sendTransport?.close();
+      call.adminSocket._recvTransport?.close();
+    }
+
     delete calls[callId];
   }
 
   app.get('/', (req, res) => {
-    console.log("asdasdas")
     res.json({ message: 'Hello, World!' });
   });
+
   server.listen(3000, () => console.log('Server running on port 3000'));
 }
 

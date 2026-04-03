@@ -2,7 +2,8 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupCall } from './lib/mediasoupClient';
 
-const SERVER_URL = 'https://lyrically-unregretting-michel.ngrok-free.dev';
+// const SERVER_URL = 'https://lyrically-unregretting-michel.ngrok-free.dev' ;
+const SERVER_URL = 'http://localhost:3000' ;
 
 function App() {
   const [username, setUsername] = useState('');
@@ -12,6 +13,7 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [incomingCall, setIncomingCall] = useState(null);
   const [activeCall, setActiveCall] = useState(null);
+  const [isWhisperActive, setIsWhisperActive] = useState(false);
 
   // Roster state
   const [activeCustomers, setActiveCustomers] = useState([]);
@@ -50,6 +52,13 @@ function App() {
 
     s.on('incomingCall', ({ callId, from, role }) => {
       setIncomingCall({ callId, from, role });
+    });
+
+    s.on('newProducer', ({ isWhisper }) => {
+      if (isWhisper) {
+        setIsWhisperActive(true);
+        setTimeout(() => setIsWhisperActive(false), 3000); // Temporary visual hint
+      }
     });
 
     s.on('callEnded', () => {
@@ -187,6 +196,11 @@ function App() {
       ) : (
         <div className="card">
           <div className="call-active-state">
+            {isWhisperActive && (
+              <div style={{ background: '#4caf50', color: 'white', padding: '10px', borderRadius: '5px', marginBottom: '10px' }}>
+                Admin is Whispering...
+              </div>
+            )}
             <div className="avatar">{activeCall.withUser.charAt(0).toUpperCase()}</div>
             <div className="card-title">Call with {activeCall.withUser}</div>
             <div style={{ color: 'white' }}>{activeCall.state}</div>
