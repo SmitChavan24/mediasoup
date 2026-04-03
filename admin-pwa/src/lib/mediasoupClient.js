@@ -28,6 +28,15 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
     if (state === 'failed') console.error('[mediasoup-admin] ⚠ recvTransport ICE FAILED');
   });
 
+  // ── Pre-warm an audio element for mobile autoplay policy ──────────────────
+  // Mobile browsers block audio.play() unless triggered by a user gesture.
+  const audioEl = new Audio();
+  audioEl.setAttribute('playsinline', '');
+  audioEl.setAttribute('autoplay', '');
+  // Play silent to unlock audio on this page
+  audioEl.srcObject = new MediaStream();
+  try { await audioEl.play(); } catch (_) { /* OK */ }
+
   // Helper to consume a producer
   const consume = async (producerId) => {
     const params = await new Promise(res =>
@@ -41,6 +50,10 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
     if (params.error) return null;
 
     const consumer = await recvTransport.consume(params);
+    
+    // We need separate audio elements if monitoring both simultaneously,
+    // or we can mix them. For simplicity, let's create a new one for each consumer
+    // but the first one can use the pre-warmed element.
     const audio = new Audio();
     audio.setAttribute('playsinline', '');
     audio.setAttribute('autoplay', '');
