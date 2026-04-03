@@ -22,6 +22,12 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
     });
   });
 
+  // ICE diagnostics
+  recvTransport.on('connectionstatechange', (state) => {
+    console.log(`[mediasoup-admin] recvTransport connection: ${state}`);
+    if (state === 'failed') console.error('[mediasoup-admin] ⚠ recvTransport ICE FAILED');
+  });
+
   // Helper to consume a producer
   const consume = async (producerId) => {
     const params = await new Promise(res =>
@@ -35,9 +41,10 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
     if (params.error) return null;
 
     const consumer = await recvTransport.consume(params);
-    const stream = new MediaStream([consumer.track]);
     const audio = new Audio();
-    audio.srcObject = stream;
+    audio.setAttribute('playsinline', '');
+    audio.setAttribute('autoplay', '');
+    audio.srcObject = new MediaStream([consumer.track]);
     audio.play().catch(e => console.error('Monitor audio play error:', e));
     return consumer;
   };
