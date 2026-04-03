@@ -2,7 +2,8 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupMonitor } from './lib/mediasoupClient';
 
-const SERVER_URL = 'http://localhost:3000'; // Update with your server URL
+// const SERVER_URL = 'http://localhost:3000'; 
+const SERVER_URL = 'https://lyrically-unregretting-michel.ngrok-free.dev';
 
 function App() {
   const [username, setUsername] = useState('');
