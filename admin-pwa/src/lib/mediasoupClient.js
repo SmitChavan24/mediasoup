@@ -11,7 +11,9 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
 
   // Admin only needs Recv transport for monitoring, and Send for whispering
   const recvParams = await new Promise(res => socket.emit('createRecvTransport', res));
-  const recvTransport = device.createRecvTransport(recvParams);
+  // Extract iceServers (STUN/TURN) from the server for NAT traversal on mobile
+  const { iceServers: recvIce, ...recvRest } = recvParams;
+  const recvTransport = device.createRecvTransport({ ...recvRest, iceServers: recvIce });
 
   recvTransport.on('connect', ({ dtlsParameters }, cb, errback) => {
     socket.emit('connectRecvTransport', { dtlsParameters }, (err) => {
@@ -61,7 +63,8 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
     startWhispering: async () => {
       if (!sendTransport) {
         const sendParams = await new Promise(res => socket.emit('createSendTransport', res));
-        sendTransport = device.createSendTransport(sendParams);
+        const { iceServers: sendIce, ...sendRest } = sendParams;
+        sendTransport = device.createSendTransport({ ...sendRest, iceServers: sendIce });
 
         sendTransport.on('connect', ({ dtlsParameters }, cb, errback) => {
           socket.emit('connectSendTransport', { dtlsParameters }, (err) => {

@@ -13,8 +13,12 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   const sendParams = await new Promise(res => socket.emit('createSendTransport', res));
   const recvParams = await new Promise(res => socket.emit('createRecvTransport', res));
 
-  const sendTransport = device.createSendTransport(sendParams);
-  const recvTransport = device.createRecvTransport(recvParams);
+  // Extract iceServers (STUN/TURN) from the server for NAT traversal on mobile
+  const { iceServers: sendIce, ...sendRest } = sendParams;
+  const { iceServers: recvIce, ...recvRest } = recvParams;
+
+  const sendTransport = device.createSendTransport({ ...sendRest, iceServers: sendIce });
+  const recvTransport = device.createRecvTransport({ ...recvRest, iceServers: recvIce });
 
   // Wire up DTLS connect events
   sendTransport.on('connect', ({ dtlsParameters }, cb, errback) => {
