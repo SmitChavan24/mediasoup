@@ -29,15 +29,54 @@ const transportOptions = {
   preferUdp: true,
 };
 
-let worker, router;
+// ── Worker Pool ───────────────────────────────────────────────────────────────
+// One worker per CPU core. Each worker owns one router.
+// All routers use the same mediaCodecs so RTP capabilities are identical.
+const workers = [];
+let workerIndex = 0;
 
-async function startMediasoup() {
-  worker = await mediasoup.createWorker({ logLevel: 'warn' });
-  router = await worker.createRouter({ mediaCodecs });
-  console.log('mediasoup router ready');
+async function spawnWorker(index) {
+  const worker = await mediasoup.createWorker({
+    logLevel: 'warn',
+    rtcMinPort: 10000,   // ← 50 000 ports shared across all workers
+    rtcMaxPort: 59999,   //   comfortably handles 800+ simultaneous transports
+  });
+
+  // Auto-respawn crashed workers so the pool stays healthy
+  worker.on('died', async () => {
+    console.error(`[mediasoup] Worker[${index}] (pid ${worker.pid}) died — respawning in 1 s...`);
+    await new Promise(r => setTimeout(r, 1000));
+    workers[index] = await spawnWorker(index);
+  });
+
+  const router = await worker.createRouter({ mediaCodecs });
+  console.log(`[mediasoup] Worker[${index}] (pid ${worker.pid}) ready`);
+  return { worker, router };
 }
 
-async function createTransport() {
+async function startMediasoup() {
+  const numCores = os.cpus().length;
+  console.log(`[mediasoup] Spawning ${numCores} worker(s) (one per CPU core)...`);
+  for (let i = 0; i < numCores; i++) {
+    workers[i] = await spawnWorker(i);
+  }
+  console.log(`[mediasoup] All ${numCores} workers ready.`);
+}
+
+// Round-robin: each call gets the next worker in the pool
+function getNextRouter() {
+  const entry = workers[workerIndex % workers.length];
+  workerIndex = (workerIndex + 1) % workers.length;
+  return entry.router;
+}
+
+// Returns any router — used only for capability queries before a call starts
+function getAnyRouter() {
+  return workers[0]?.router;
+}
+
+// ── Transport factory (accepts the per-call router) ───────────────────────────
+async function createTransport(router) {
   const transport = await router.createWebRtcTransport(transportOptions);
   return {
     transport,
@@ -50,4 +89,4 @@ async function createTransport() {
   };
 }
 
-module.exports = { startMediasoup, createTransport, getRouter: () => router };
+module.exports = { startMediasoup, createTransport, getNextRouter, getAnyRouter };
