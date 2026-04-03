@@ -40,6 +40,53 @@ const RTC_MIN_PORT = 40000;
 const RTC_MAX_PORT = 40200;
 
 let worker, router, announcedIp;
+let cachedIceServers = null;
+
+async function getIceServers() {
+  if (cachedIceServers) return cachedIceServers;
+  try {
+    const https = require('https');
+    return new Promise((resolve, reject) => {
+      https.get('https://tglevels.metered.live/api/v1/turn/credentials?apiKey=89c2d061cef1700374b542ad790f36abd49d', (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            cachedIceServers = JSON.parse(data);
+            resolve(cachedIceServers);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }).on('error', reject);
+    });
+  } catch (error) {
+    console.error("[mediasoup] Failed to fetch dynamic ICE servers, using fallbacks.");
+    return [
+      { urls: 'stun:stun.relay.metered.ca:80' },
+      {
+        urls: 'turn:global.relay.metered.ca:80',
+        username: '1931f85ebf8e9eb113834fe3',
+        credential: 'bb87UyBhpsRSlKD8',
+      },
+      {
+        urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+        username: '1931f85ebf8e9eb113834fe3',
+        credential: 'bb87UyBhpsRSlKD8',
+      },
+      {
+        urls: 'turn:global.relay.metered.ca:443',
+        username: '1931f85ebf8e9eb113834fe3',
+        credential: 'bb87UyBhpsRSlKD8',
+      },
+      {
+        urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+        username: '1931f85ebf8e9eb113834fe3',
+        credential: 'bb87UyBhpsRSlKD8',
+      },
+    ];
+  }
+}
 
 async function startMediasoup() {
   // 1. Determine the announced IP
@@ -86,27 +133,17 @@ async function createTransport() {
   };
 
   const transport = await router.createWebRtcTransport(transportOptions);
+  const iceServers = await getIceServers();
 
   return {
     transport,
     params: {
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
+      id:             transport.id,
+      iceParameters:  transport.iceParameters,
+      iceCandidates:  transport.iceCandidates,
       dtlsParameters: transport.dtlsParameters,
       // STUN + TURN servers for NAT traversal on mobile / restrictive networks
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        {
-          urls: 'turn:free.expressturn.com:3478',
-          username: '000000002090563597',
-          credential: '14jWHzL356cUf8wd7cupbCT4qKo=',
-        },
-        { urls: 'turn:numb.viagenie.ca', credential: 'muazkh', username: 'webrtc@live.com' },
-        { urls: 'turn:turn.bistri.com:80', credential: 'homeo', username: 'homeo' },
-        { urls: 'turn:turn.anyfirewall.com:443?transport=tcp', credential: 'webrtc', username: 'webrtc' },
-      ],
+      iceServers,
     }
   };
 }
