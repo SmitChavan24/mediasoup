@@ -125,8 +125,22 @@ async function startMediasoup() {
 }
 
 async function createTransport() {
+  const ips = [];
+  if (announcedIp) {
+    ips.push({ ip: '0.0.0.0', announcedIp });
+  }
+  // Also announce the local network IP for devices on the same WiFi
+  const localIp = getLocalIp();
+  if (localIp && localIp !== announcedIp) {
+    ips.push({ ip: '0.0.0.0', announcedIp: localIp });
+  }
+  // If neither were available (e.g., error), fallback to 0.0.0.0
+  if (ips.length === 0) {
+    ips.push({ ip: '0.0.0.0' });
+  }
+
   const transportOptions = {
-    listenIps: [{ ip: '0.0.0.0', announcedIp }],
+    listenIps: ips,
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,
