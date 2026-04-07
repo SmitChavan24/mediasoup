@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupCall } from './lib/mediasoupClient';
 
-const SERVER_URL = 'https://lyrically-unregretting-michel.ngrok-free.dev';
+const SERVER_URL = '';
 
 function App() {
   const [username, setUsername] = useState('');
