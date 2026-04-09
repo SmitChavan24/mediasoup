@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
-import { setupCall } from './lib/mediasoupClient';
+import { setupCall, getCurrentCallId, clearCurrentCallId } from './lib/mediasoupClient';
 
 const SERVER_URL = '';
 
@@ -12,11 +12,14 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [activeCall, setActiveCall] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [peerDisconnected, setPeerDisconnected] = useState(null);
 
   // Roster state
   const [activeAgents, setActiveAgents] = useState([]);
 
   const callRef = useRef(null);
+  const previousSocketId = useRef(null);
 
   const handleLogin = (e) => {
     e.preventDefault();
@@ -30,18 +33,64 @@ function App() {
     const s = io(SERVER_URL, {
       query: { role: 'customer', username: username.trim() },
       transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: 10,
       extraHeaders: {
         'ngrok-skip-browser-warning': 'true'
       }
     });
 
     s.on('connect', () => {
+      console.log(`[customer] Connected with socket.id=${s.id}`);
+
+      // If we were reconnecting and had an active call, try to restore
+      if (reconnecting && previousSocketId.current && getCurrentCallId()) {
+        const callId = getCurrentCallId();
+        console.log(`[customer] Attempting session reconnection: prev=${previousSocketId.current} callId=${callId}`);
+
+        s.emit('reconnectSession', {
+          previousSocketId: previousSocketId.current,
+          callId,
+        }, async (res) => {
+          if (res.success) {
+            console.log('[customer] ✅ Session restored!');
+            setReconnecting(false);
+            setPeerDisconnected(null);
+
+            // Re-setup media
+            try {
+              const callTransports = await setupCall(s, res.callId, () => {
+                console.log('Remote audio playing (reconnected)');
+              });
+              callRef.current = callTransports;
+            } catch (err) {
+              console.error('[customer] Failed to restore media:', err);
+              endCall();
+            }
+          } else {
+            console.log(`[customer] ❌ Session restore failed: ${res.reason} — cleaning up`);
+            setReconnecting(false);
+            clearCurrentCallId();
+            handleCallCleanup();
+          }
+        });
+      }
+
+      previousSocketId.current = s.id;
       setConnected(true);
       s.emit('getPresence'); // Fetch current roster
     });
 
     s.on('disconnect', () => {
       setConnected(false);
+
+      // If we had an active call, enter reconnecting state
+      if (activeCall || getCurrentCallId()) {
+        setReconnecting(true);
+        console.log('[customer] Socket disconnected during active call — will attempt reconnection');
+      }
     });
 
     s.on('presenceUpdate', ({ agents }) => {
@@ -57,6 +106,20 @@ function App() {
       handleCallCleanup();
     });
 
+    // Handle peer disconnect/reconnect notifications
+    s.on('participantDisconnected', ({ username: peerName, gracePeriod }) => {
+      setPeerDisconnected({ username: peerName, gracePeriod });
+    });
+
+    s.on('participantReconnected', () => {
+      setPeerDisconnected(null);
+    });
+
+    // Respond to server heartbeat
+    s.on('hb-ping', () => {
+      s.emit('hb-pong');
+    });
+
     setSocket(s);
   };
 
@@ -65,8 +128,11 @@ function App() {
       callRef.current.close();
       callRef.current = null;
     }
+    clearCurrentCallId();
     setActiveCall(null);
     setIncomingCall(null);
+    setReconnecting(false);
+    setPeerDisconnected(null);
   };
 
   const callAnyAgent = () => {
@@ -163,8 +229,12 @@ function App() {
       <div className="header">
         <h1>Customer Support</h1>
         <div className="status">
-          <div className={`status-indicator ${connected ? 'connected' : ''}`}></div>
-          {connected ? `Connected as ${username}` : 'Connecting...'}
+          <div className={`status-indicator ${connected ? 'connected' : reconnecting ? 'reconnecting' : ''}`}></div>
+          {reconnecting
+            ? 'Reconnecting...'
+            : connected
+              ? `Connected as ${username}`
+              : 'Connecting...'}
         </div>
       </div>
 
@@ -225,6 +295,11 @@ function App() {
             <div className="avatar">CS</div>
             <div className="card-title">Call with {activeCall.withUser}</div>
             <div style={{ color: 'var(--text-primary)', fontWeight: 'bold' }}>{activeCall.state}</div>
+            {peerDisconnected && (
+              <div style={{ color: '#ffab00', fontSize: '14px', marginTop: 4 }}>
+                ⚠️ {peerDisconnected.username} disconnected — waiting {peerDisconnected.gracePeriod}s for reconnection...
+              </div>
+            )}
             <div className="call-timer">00:00</div>
             <button className="danger" onClick={endCall}>End Call</button>
           </div>

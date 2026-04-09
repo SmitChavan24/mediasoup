@@ -5,6 +5,34 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { startMediasoup, createTransport, getNextRouter, getAnyRouter } = require('./mediasoup');
 const { register, m, startPeriodicLog, printMetricsSnapshot } = require('./metrics');
+const {
+  createRedisClients,
+  cleanupStaleState,
+  GRACE_PERIOD_SECONDS,
+
+  setUser,
+  getUser,
+  updateUser,
+  deleteUser,
+
+  addToPresence,
+  removeFromPresence,
+  getPresenceList,
+  getPresenceCount,
+
+  setCall,
+  getCall,
+  updateCall,
+  deleteCall,
+  getAllActiveCalls,
+
+  setGracePeriod,
+  getGracePeriod,
+  deleteGracePeriod,
+
+  subscribeToExpirations,
+} = require('./redisState');
+const { attachHeartbeat } = require('./heartbeat');
 
 const app = express();
 app.use(cors());
@@ -12,27 +40,29 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// In-memory call state
-// calls[callId] = { agentSocket, customerSocket, transports, producers, consumers }
-const calls = {};
+// ── Local mediasoup transport/producer/consumer refs ──────────────────────────
+// These are C++ objects that cannot be serialised into Redis and MUST live in
+// the same process.  We index them by socket.id so we can clean them up.
+const localTransports = {};   // socketId → { sendTransport, recvTransport }
+const localProducers  = {};   // socketId → producer
+const localConsumers  = {};   // socketId → consumer
 
-// Presence tracking
-// Map socket.id -> { id, username, role }
-const activeUsers = new Map();
+// ── Per-call router mapping ──────────────────────────────────────────────────
+// Each call MUST use a single router for all its transports (send/recv for both
+// parties).  Routers are C++ objects that can't live in Redis, so we keep a
+// local map.  The router is assigned once when the call is created (dialOut /
+// callIn) and reused for every createTransport / consume within that call.
+const callRouters = {};       // callId → router
 
-function broadcastPresence() {
-  const agents = [];
-  const customers = [];
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-  for (const [id, user] of activeUsers.entries()) {
-    if (user.role === 'agent') {
-      agents.push(user);
-    } else if (user.role === 'customer') {
-      customers.push(user);
-    }
-  }
+async function broadcastPresence() {
+  const [agents, customers] = await Promise.all([
+    getPresenceList('agent'),
+    getPresenceList('customer'),
+  ]);
 
-  // Update presence gauges
+  // Update Prometheus gauges
   m.activeUsersGauge.set({ role: 'agent' }, agents.length);
   m.activeUsersGauge.set({ role: 'customer' }, customers.length);
 
@@ -40,42 +70,287 @@ function broadcastPresence() {
   io.emit('presenceUpdate', { agents, customers });
 }
 
-async function main() {
-  await startMediasoup();
+/**
+ * Full cleanup when a user is gone for good (hangup, grace expired, etc.)
+ * Closes mediasoup transports/producers/consumers and removes all Redis state.
+ */
+async function fullCleanup(socketId) {
+  const user = await getUser(socketId);
+  if (!user) return;
 
-  // Set worker count gauge once the pool is ready
+  const callId = user.callId;
+
+  // Close mediasoup C++ objects for this socket
+  closeLocalMediasoup(socketId);
+
+  // If they were in a call, clean up the call
+  if (callId && callId !== '') {
+    const call = await getCall(callId);
+    if (call) {
+      // Find the other party
+      const otherSocketId = call.agentSocketId === socketId
+        ? call.customerSocketId
+        : call.agentSocketId;
+
+      // Notify the other party
+      if (otherSocketId) {
+        const otherSocket = io.sockets.sockets.get(otherSocketId);
+        if (otherSocket) {
+          otherSocket.emit('callEnded');
+        }
+
+        // Close the other party's mediasoup resources too
+        closeLocalMediasoup(otherSocketId);
+
+        // Clear the other party's callId
+        await updateUser(otherSocketId, { callId: '' });
+      }
+
+      // Record call duration + metrics
+      let durationSec = 0;
+      if (call.startTime) {
+        durationSec = (Date.now() - parseInt(call.startTime, 10)) / 1000;
+        m.callDurationHistogram.observe(durationSec);
+      }
+      m.callsEndedCounter.inc();
+      m.activeCallsGauge.dec();
+
+      console.log(`[endCall] 🛑 callId=${callId} ended (duration: ${durationSec.toFixed(1)}s)`);
+
+      // Notify any admins monitoring this call
+      io.to(`monitor:${callId}`).emit('callEnded');
+      // Clean up monitoring admins' mediasoup resources
+      const monitorRoom = io.sockets.adapter.rooms.get(`monitor:${callId}`);
+      if (monitorRoom) {
+        for (const adminSocketId of monitorRoom) {
+          closeLocalMediasoup(adminSocketId);
+          await updateUser(adminSocketId, { callId: '' });
+        }
+      }
+
+      delete callRouters[callId];
+      await deleteCall(callId);
+    }
+  }
+
+  // Remove from presence and delete user
+  await removeFromPresence(user.role, socketId);
+  await deleteUser(socketId);
+  await deleteGracePeriod(socketId);
+
+  await broadcastPresence();
+
+  // Notify admin dashboards
+  io.to('admins').emit('callsUpdated');
+
+  console.log(`[cleanup] 🧹 Full cleanup complete for socket=${socketId} user=${user.username}`);
+}
+
+function closeLocalMediasoup(socketId) {
+  const transports = localTransports[socketId];
+  if (transports) {
+    try { transports.sendTransport?.close(); } catch (_) { }
+    try { transports.recvTransport?.close(); } catch (_) { }
+    delete localTransports[socketId];
+  }
+  try { localProducers[socketId]?.close(); } catch (_) { }
+  try { localConsumers[socketId]?.close(); } catch (_) { }
+  delete localProducers[socketId];
+  delete localConsumers[socketId];
+}
+
+/**
+ * endCall — called on explicit hangup.  Cleans up both parties immediately
+ * (no grace period since this is an intentional hangup).
+ */
+async function endCall(socket) {
+  const user = await getUser(socket.id);
+  if (!user || !user.callId) return;
+
+  const callId = user.callId;
+  const call = await getCall(callId);
+  if (!call) return;
+
+  // Record call duration + metrics
+  let durationSec = 0;
+  if (call.startTime) {
+    durationSec = (Date.now() - parseInt(call.startTime, 10)) / 1000;
+    m.callDurationHistogram.observe(durationSec);
+  }
+  m.callsEndedCounter.inc();
+  m.activeCallsGauge.dec();
+
+  console.log(`[endCall] 🛑 callId=${callId} ended (duration: ${durationSec.toFixed(1)}s)`);
+
+  // Find the other party
+  const otherSocketId = call.agentSocketId === socket.id
+    ? call.customerSocketId
+    : call.agentSocketId;
+
+  // Notify + cleanup other party
+  if (otherSocketId) {
+    const otherSocket = io.sockets.sockets.get(otherSocketId);
+    if (otherSocket) {
+      otherSocket.emit('callEnded');
+    }
+    closeLocalMediasoup(otherSocketId);
+    await updateUser(otherSocketId, { callId: '' });
+  }
+
+  // Cleanup this socket
+  closeLocalMediasoup(socket.id);
+  await updateUser(socket.id, { callId: '' });
+
+  // Notify any admins monitoring this call
+  io.to(`monitor:${callId}`).emit('callEnded');
+  const monitorRoom = io.sockets.adapter.rooms.get(`monitor:${callId}`);
+  if (monitorRoom) {
+    for (const adminSocketId of monitorRoom) {
+      closeLocalMediasoup(adminSocketId);
+      await updateUser(adminSocketId, { callId: '' });
+    }
+  }
+
+  // Delete the call and its router reference
+  delete callRouters[callId];
+  await deleteCall(callId);
+
+  console.log(`[endCall] 🧹 Cleaned up all resources for callId=${callId}`);
+
+  // Notify admin dashboards
+  io.to('admins').emit('callsUpdated');
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  // 1. Connect to Redis and clean stale state
+  createRedisClients();
+  await cleanupStaleState();
+
+  // 2. Start mediasoup workers
+  await startMediasoup();
   m.workerCountGauge.set(require('os').cpus().length);
 
-  io.on('connection', (socket) => {
+  // 3. Subscribe to Redis grace-period expirations
+  subscribeToExpirations(async (socketId) => {
+    console.log(`[grace] ⏰ Grace period expired for ${socketId} — running full cleanup`);
+    await fullCleanup(socketId);
+  });
+
+  // 4. Socket.IO connection handler
+  io.on('connection', async (socket) => {
     m.connectionsCounter.inc();
     const { role, username } = socket.handshake.query;
 
     if (role && username) {
       console.log(`[connect] ✅ ${role} connected: ${username} (${socket.id})`);
 
-      activeUsers.set(socket.id, {
-        id: socket.id,
-        username,
-        role
-      });
+      await setUser(socket.id, { username, role, status: 'connected' });
+      await addToPresence(role, socket.id);
 
       if (role === 'agent') {
         socket.join('agents');
       } else if (role === 'customer') {
         socket.join('customers');
+      } else if (role === 'admin') {
+        socket.join('admins');
       }
 
-      broadcastPresence();
+      // Admins don't appear in agent/customer presence — only broadcast for agents & customers
+      await broadcastPresence();
     } else {
       console.warn(`[connect] ⚠️  Socket ${socket.id} connected without role/username`);
     }
 
+    // Attach application-level heartbeat
+    attachHeartbeat(socket, async (timedOutSocket) => {
+      console.log(`[heartbeat] 💀 Heartbeat timeout for ${timedOutSocket.id} — triggering disconnect`);
+      timedOutSocket.disconnect(true);
+    });
+
+    // ── Reconnection: client tries to restore a previous session ───────────
+    socket.on('reconnectSession', async ({ previousSocketId, callId }, cb) => {
+      console.log(`[reconnect] 🔄 Reconnect attempt: newSocket=${socket.id} prevSocket=${previousSocketId} callId=${callId}`);
+
+      const gracedCallId = await getGracePeriod(previousSocketId);
+
+      if (gracedCallId && gracedCallId === callId) {
+        // ✅ Grace period still active — restore session
+        console.log(`[reconnect] ✅ Grace period active — restoring session`);
+
+        const call = await getCall(callId);
+        if (!call) {
+          console.warn(`[reconnect] ⚠️  Call ${callId} no longer exists`);
+          return cb({ success: false, reason: 'call_ended' });
+        }
+
+        const user = await getUser(previousSocketId);
+        if (!user) {
+          console.warn(`[reconnect] ⚠️  User data for ${previousSocketId} not found`);
+          return cb({ success: false, reason: 'session_expired' });
+        }
+
+        // Migrate user data to new socket ID
+        await deleteUser(previousSocketId);
+        await removeFromPresence(user.role, previousSocketId);
+        closeLocalMediasoup(previousSocketId);
+
+        await setUser(socket.id, { username: user.username, role: user.role, status: 'connected' });
+        await updateUser(socket.id, { callId });
+        await addToPresence(user.role, socket.id);
+
+        // Update call record with new socket ID
+        if (call.agentSocketId === previousSocketId) {
+          await updateCall(callId, { agentSocketId: socket.id });
+        } else {
+          await updateCall(callId, { customerSocketId: socket.id });
+        }
+
+        // Cancel grace period
+        await deleteGracePeriod(previousSocketId);
+
+        // Join appropriate room
+        if (user.role === 'agent') socket.join('agents');
+        else socket.join('customers');
+
+        // Notify the other party
+        const updatedCall = await getCall(callId);
+        const otherSocketId = updatedCall.agentSocketId === socket.id
+          ? updatedCall.customerSocketId
+          : updatedCall.agentSocketId;
+
+        if (otherSocketId) {
+          const otherSocket = io.sockets.sockets.get(otherSocketId);
+          if (otherSocket) {
+            otherSocket.emit('participantReconnected', { userId: socket.id });
+          }
+        }
+
+        await broadcastPresence();
+
+        cb({ success: true, callId, role: user.role, username: user.username });
+      } else {
+        // ❌ Grace period expired or not found
+        console.log(`[reconnect] ❌ No active grace period — must rejoin fresh`);
+        cb({ success: false, reason: 'grace_expired' });
+      }
+    });
+
     // ── STEP 1: Client requests router RTP capabilities ──────────────────
-    // Use the call's assigned router if available; otherwise any router
-    // (all workers share identical RTP capabilities via the same mediaCodecs).
-    socket.on('getRouterRtpCapabilities', (cb) => {
-      const callId = socket._callId;
-      const router = (callId && calls[callId]?.router) || getAnyRouter();
+    socket.on('getRouterRtpCapabilities', async (cb) => {
+      const user = await getUser(socket.id);
+      const callId = user?.callId;
+      let router;
+
+      if (callId) {
+        const call = await getCall(callId);
+        if (call) {
+          router = getAnyRouter(); // All routers share identical RTP caps
+        }
+      }
+      router = router || getAnyRouter();
+
       console.log(`[rtp] 📋 getRouterRtpCapabilities for socket=${socket.id} callId=${callId || 'none'} routerId=${router?.id}`);
       cb(router.rtpCapabilities);
     });
@@ -83,11 +358,17 @@ async function main() {
     // ── STEP 2: Create a send (produce) transport ─────────────────────────
     socket.on('createSendTransport', async (cb) => {
       try {
-        const callId = socket._callId;
-        const router = (callId && calls[callId]?.router) || getAnyRouter();
+        const user = await getUser(socket.id);
+        const callId = user?.callId;
+        // Use the call's assigned router — all transports in a call MUST share one router
+        const router = (callId && callRouters[callId]) || getAnyRouter();
+
         console.log(`[transport] 📤 Creating SEND transport for socket=${socket.id} callId=${callId || 'none'} routerId=${router?.id}`);
         const { transport, params } = await createTransport(router);
-        socket._sendTransport = transport;
+
+        if (!localTransports[socket.id]) localTransports[socket.id] = {};
+        localTransports[socket.id].sendTransport = transport;
+
         console.log(`[transport] ✅ SEND transport created: ${transport.id} for socket=${socket.id}`);
         cb(params);
       } catch (err) {
@@ -99,11 +380,17 @@ async function main() {
     // ── STEP 3: Create a recv (consume) transport ─────────────────────────
     socket.on('createRecvTransport', async (cb) => {
       try {
-        const callId = socket._callId;
-        const router = (callId && calls[callId]?.router) || getAnyRouter();
+        const user = await getUser(socket.id);
+        const callId = user?.callId;
+        // Use the call's assigned router — all transports in a call MUST share one router
+        const router = (callId && callRouters[callId]) || getAnyRouter();
+
         console.log(`[transport] 📥 Creating RECV transport for socket=${socket.id} callId=${callId || 'none'} routerId=${router?.id}`);
         const { transport, params } = await createTransport(router);
-        socket._recvTransport = transport;
+
+        if (!localTransports[socket.id]) localTransports[socket.id] = {};
+        localTransports[socket.id].recvTransport = transport;
+
         console.log(`[transport] ✅ RECV transport created: ${transport.id} for socket=${socket.id}`);
         cb(params);
       } catch (err) {
@@ -115,9 +402,10 @@ async function main() {
     // ── STEP 4: Connect send transport (DTLS handshake) ───────────────────
     socket.on('connectSendTransport', async ({ dtlsParameters }, cb) => {
       try {
-        console.log(`[dtls] 🔒 connectSendTransport for socket=${socket.id} transportId=${socket._sendTransport?.id}`);
+        const sendTransport = localTransports[socket.id]?.sendTransport;
+        console.log(`[dtls] 🔒 connectSendTransport for socket=${socket.id} transportId=${sendTransport?.id}`);
         console.log(`[dtls]    DTLS role: ${dtlsParameters?.role}, fingerprints: ${dtlsParameters?.fingerprints?.length || 0}`);
-        await socket._sendTransport.connect({ dtlsParameters });
+        await sendTransport.connect({ dtlsParameters });
         console.log(`[dtls] ✅ SEND transport connected for socket=${socket.id}`);
         cb();
       } catch (err) {
@@ -129,9 +417,10 @@ async function main() {
     // ── STEP 5: Connect recv transport ────────────────────────────────────
     socket.on('connectRecvTransport', async ({ dtlsParameters }, cb) => {
       try {
-        console.log(`[dtls] 🔒 connectRecvTransport for socket=${socket.id} transportId=${socket._recvTransport?.id}`);
+        const recvTransport = localTransports[socket.id]?.recvTransport;
+        console.log(`[dtls] 🔒 connectRecvTransport for socket=${socket.id} transportId=${recvTransport?.id}`);
         console.log(`[dtls]    DTLS role: ${dtlsParameters?.role}, fingerprints: ${dtlsParameters?.fingerprints?.length || 0}`);
-        await socket._recvTransport.connect({ dtlsParameters });
+        await recvTransport.connect({ dtlsParameters });
         console.log(`[dtls] ✅ RECV transport connected for socket=${socket.id}`);
         cb();
       } catch (err) {
@@ -145,10 +434,12 @@ async function main() {
       try {
         console.log(`[produce] 🎤 Produce request: socket=${socket.id} kind=${kind} callId=${callId}`);
         console.log(`[produce]    RTP codecs: ${rtpParameters?.codecs?.map(c => c.mimeType).join(', ')}`);
-        console.log(`[produce]    sendTransport exists: ${!!socket._sendTransport}, id=${socket._sendTransport?.id}`);
 
-        const producer = await socket._sendTransport.produce({ kind, rtpParameters });
-        socket._producer = producer;
+        const sendTransport = localTransports[socket.id]?.sendTransport;
+        console.log(`[produce]    sendTransport exists: ${!!sendTransport}, id=${sendTransport?.id}`);
+
+        const producer = await sendTransport.produce({ kind, rtpParameters });
+        localProducers[socket.id] = producer;
         console.log(`[produce] ✅ Producer created: id=${producer.id} kind=${producer.kind} paused=${producer.paused}`);
 
         // Log producer lifecycle events
@@ -159,19 +450,31 @@ async function main() {
           console.log(`[produce] 📊 Producer ${producer.id} score:`, JSON.stringify(score));
         });
 
-        const call = calls[callId];
+        const call = await getCall(callId);
         if (!call) {
           console.error(`[produce] ❌ Call not found: callId=${callId}`);
           return cb({ error: 'Call not found' });
         }
 
+        const user = await getUser(socket.id);
+
         // Tell the other party to consume this new producer
-        const otherSocket = role === 'agent' ? call.customerSocket : call.agentSocket;
-        if (otherSocket) {
-          console.log(`[produce] 📢 Emitting newProducer to other party socket=${otherSocket.id} producerId=${producer.id}`);
-          otherSocket.emit('newProducer', { producerId: producer.id });
-        } else {
+        const otherSocketId = user?.role === 'agent' ? call.customerSocketId : call.agentSocketId;
+        if (otherSocketId) {
+          const otherSocket = io.sockets.sockets.get(otherSocketId);
+          if (otherSocket) {
+            console.log(`[produce] 📢 Emitting newProducer to other party socket=${otherSocketId} producerId=${producer.id}`);
+            otherSocket.emit('newProducer', { producerId: producer.id });
+          } else {
+            console.warn(`[produce] ⚠️  Other party socket ${otherSocketId} not found in io.sockets — newProducer NOT sent`);
+          }
+        } else if (user?.role !== 'admin') {
           console.warn(`[produce] ⚠️  No other party socket found in call ${callId} — newProducer NOT sent`);
+        }
+
+        // Notify monitoring admins about this new producer (include role for the admin client)
+        if (user?.role !== 'admin') {
+          io.to(`monitor:${callId}`).emit('newProducer', { producerId: producer.id, role: user?.role });
         }
 
         cb({ id: producer.id });
@@ -185,7 +488,8 @@ async function main() {
     socket.on('consume', async ({ producerId, rtpCapabilities, callId }, cb) => {
       try {
         console.log(`[consume] 🔊 Consume request: socket=${socket.id} producerId=${producerId} callId=${callId}`);
-        const router = (callId && calls[callId]?.router) || getAnyRouter();
+        // MUST use the same router the producer was created on
+        const router = (callId && callRouters[callId]) || getAnyRouter();
 
         const canConsume = router.canConsume({ producerId, rtpCapabilities });
         console.log(`[consume] canConsume=${canConsume} routerId=${router?.id}`);
@@ -195,13 +499,14 @@ async function main() {
           return cb({ error: 'Cannot consume' });
         }
 
-        console.log(`[consume]    recvTransport exists: ${!!socket._recvTransport}, id=${socket._recvTransport?.id}`);
-        const consumer = await socket._recvTransport.consume({
+        const recvTransport = localTransports[socket.id]?.recvTransport;
+        console.log(`[consume]    recvTransport exists: ${!!recvTransport}, id=${recvTransport?.id}`);
+        const consumer = await recvTransport.consume({
           producerId,
           rtpCapabilities,
           paused: false,
         });
-        socket._consumer = consumer;
+        localConsumers[socket.id] = consumer;
         console.log(`[consume] ✅ Consumer created: id=${consumer.id} kind=${consumer.kind} producerId=${producerId} paused=${consumer.paused}`);
 
         // Log consumer lifecycle events
@@ -236,7 +541,7 @@ async function main() {
     // ── CALL INITIATION ───────────────────────────────────────────────────
 
     // Any-to-Any Direct Dial (Agent->Customer or Customer->Agent)
-    socket.on('dialOut', ({ targetId }, cb) => {
+    socket.on('dialOut', async ({ targetId }, cb) => {
       const callId = `call_${Date.now()}`;
       const targetSocket = io.sockets.sockets.get(targetId);
 
@@ -245,27 +550,33 @@ async function main() {
         return cb({ error: 'Target user not found or offline.' });
       }
 
-      const callerUser = activeUsers.get(socket.id);
-
-      // Assign a dedicated router from the pool for this call (round-robin)
+      const callerUser = await getUser(socket.id);
       const router = getNextRouter();
+      callRouters[callId] = router;  // Store locally — C++ object can't go to Redis
 
-      // Assume the caller is agent and target is customer by default,
-      // but flip it if the caller is the customer.
+      // Build call record
+      const callData = {
+        routerIndex: 0,
+        startTime: Date.now(),
+      };
+
       if (callerUser.role === 'customer') {
-        calls[callId] = { agentSocket: targetSocket, customerSocket: socket, router, startTime: Date.now() };
+        callData.agentSocketId = targetId;
+        callData.customerSocketId = socket.id;
       } else {
-        calls[callId] = { agentSocket: socket, customerSocket: targetSocket, router, startTime: Date.now() };
+        callData.agentSocketId = socket.id;
+        callData.customerSocketId = targetId;
       }
 
-      socket._callId = callId;
-      targetSocket._callId = callId;
+      await setCall(callId, callData);
+      await updateUser(socket.id, { callId });
+      await updateUser(targetId, { callId });
 
       // Metrics
       m.callsInitiatedCounter.inc({ type: 'dialOut' });
       m.activeCallsGauge.inc();
 
-      console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetId} | callId=${callId} | routerId=${router.id}`);
+      console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetId} | callId=${callId}`);
 
       targetSocket.emit('incomingCall', {
         callId,
@@ -274,23 +585,31 @@ async function main() {
       });
 
       cb({ callId });
+
+      // Notify admin dashboards about new call
+      io.to('admins').emit('callsUpdated');
     });
 
     // Generic "Call First Available" fallback (Customer to anyone)
-    socket.on('callIn', () => {
+    socket.on('callIn', async () => {
       const callId = `call_${Date.now()}`;
+      const callerUser = await getUser(socket.id);
       const router = getNextRouter();
-      // Assign a dedicated router from the pool for this call (round-robin)
-      calls[callId] = { customerSocket: socket, agentSocket: null, router, startTime: Date.now() };
-      socket._callId = callId;
+      callRouters[callId] = router;  // Store locally — C++ object can't go to Redis
 
-      const callerUser = activeUsers.get(socket.id);
+      await setCall(callId, {
+        customerSocketId: socket.id,
+        agentSocketId: '',
+        routerIndex: 0,
+        startTime: Date.now(),
+      });
+      await updateUser(socket.id, { callId });
 
       // Metrics
       m.callsInitiatedCounter.inc({ type: 'callIn' });
       m.activeCallsGauge.inc();
 
-      console.log(`[callIn] 📞 General queue call from: ${callerUser.username} | callId=${callId} | routerId=${router.id}`);
+      console.log(`[callIn] 📞 General queue call from: ${callerUser.username} | callId=${callId}`);
 
       // Notify all agents
       io.to('agents').emit('incomingCall', {
@@ -298,30 +617,43 @@ async function main() {
         from: callerUser.username,
         role: 'customer'
       });
+
+      // Notify admin dashboards about new call
+      io.to('admins').emit('callsUpdated');
     });
 
     // Receive acceptance
-    socket.on('acceptCall', ({ callId }, cb) => {
-      const call = calls[callId];
+    socket.on('acceptCall', async ({ callId }, cb) => {
+      const call = await getCall(callId);
       if (!call) {
         console.warn(`[acceptCall] ⚠️  Call not found or ended: callId=${callId}`);
         return cb({ error: 'Call not found or ended' });
       }
 
+      const user = await getUser(socket.id);
+
       // If this was a general 'callIn' and the agent is answering, assign the agent socket
-      if (role === 'agent' && !call.agentSocket) {
-        call.agentSocket = socket;
-        socket._callId = callId;
+      if (user.role === 'agent' && !call.agentSocketId) {
+        await updateCall(callId, { agentSocketId: socket.id });
+        await updateUser(socket.id, { callId });
       }
 
-      console.log(`[acceptCall] ✅ Call ${callId} accepted by socket=${socket.id} (${role})`);
-      console.log(`[acceptCall]    agentSocket=${call.agentSocket?.id || 'none'} customerSocket=${call.customerSocket?.id || 'none'}`);
+      console.log(`[acceptCall] ✅ Call ${callId} accepted by socket=${socket.id} (${user.role})`);
 
       // Tell the other party to start setupCall too
-      const other = socket === call.agentSocket ? call.customerSocket : call.agentSocket;
-      if (other) {
-        console.log(`[acceptCall] 📢 Emitting callAccepted to other party socket=${other.id}`);
-        other.emit('callAccepted', { callId });
+      const updatedCall = await getCall(callId);
+      const otherSocketId = socket.id === updatedCall.agentSocketId
+        ? updatedCall.customerSocketId
+        : updatedCall.agentSocketId;
+
+      if (otherSocketId) {
+        const otherSocket = io.sockets.sockets.get(otherSocketId);
+        if (otherSocket) {
+          console.log(`[acceptCall] 📢 Emitting callAccepted to other party socket=${otherSocketId}`);
+          otherSocket.emit('callAccepted', { callId });
+        } else {
+          console.warn(`[acceptCall] ⚠️  Other party socket ${otherSocketId} not found`);
+        }
       } else {
         console.warn(`[acceptCall] ⚠️  No other party found for callId=${callId}`);
       }
@@ -329,88 +661,147 @@ async function main() {
       cb({ callId });
     });
 
-    // Request presence on explicit call, just in case
-    socket.on('getPresence', () => {
-      const agents = [];
-      const customers = [];
-      for (const user of activeUsers.values()) {
-        if (user.role === 'agent') agents.push(user);
-        if (user.role === 'customer') customers.push(user);
-      }
+    // Request presence on explicit call
+    socket.on('getPresence', async () => {
+      const [agents, customers] = await Promise.all([
+        getPresenceList('agent'),
+        getPresenceList('customer'),
+      ]);
       socket.emit('presenceUpdate', { agents, customers });
     });
 
-    // ── HANGUP ────────────────────────────────────────────────────────────
-    socket.on('hangup', () => {
-      console.log(`[hangup] 📱 Hangup requested by socket=${socket.id}`);
-      endCall(socket);
+    // ── ADMIN: Get live calls ─────────────────────────────────────────────
+    socket.on('getLiveCalls', async (cb) => {
+      try {
+        const calls = await getAllActiveCalls();
+        console.log(`[admin] 📊 getLiveCalls requested by socket=${socket.id} — ${calls.length} active calls`);
+        cb(calls);
+      } catch (err) {
+        console.error(`[admin] ❌ getLiveCalls failed:`, err);
+        cb([]);
+      }
     });
 
-    socket.on('disconnect', () => {
+    // ── ADMIN: Monitor a call (silent listen) ─────────────────────────────
+    socket.on('monitorCall', async ({ callId }, cb) => {
+      try {
+        const user = await getUser(socket.id);
+        if (!user || user.role !== 'admin') {
+          return cb({ error: 'Only admins can monitor calls.' });
+        }
+
+        const call = await getCall(callId);
+        if (!call) {
+          return cb({ error: 'Call not found.' });
+        }
+
+        // If admin was monitoring another call, leave that room first
+        if (user.callId && user.callId !== '' && user.callId !== callId) {
+          socket.leave(`monitor:${user.callId}`);
+          closeLocalMediasoup(socket.id);
+        }
+
+        // Bind admin to this call's router and join monitor room
+        await updateUser(socket.id, { callId });
+        socket.join(`monitor:${callId}`);
+
+        // Get producer IDs for both parties
+        const agentProducerId = localProducers[call.agentSocketId]?.id || null;
+        const customerProducerId = localProducers[call.customerSocketId]?.id || null;
+
+        console.log(`[admin] 🎧 ${user.username} monitoring callId=${callId} agent=${agentProducerId || 'n/a'} customer=${customerProducerId || 'n/a'}`);
+
+        cb({ agentProducerId, customerProducerId });
+      } catch (err) {
+        console.error(`[admin] ❌ monitorCall failed:`, err);
+        cb({ error: err.message });
+      }
+    });
+
+    // ── ADMIN: Stop monitoring ─────────────────────────────────────────────
+    socket.on('stopMonitoring', async () => {
+      const user = await getUser(socket.id);
+      if (!user || user.role !== 'admin') return;
+
+      if (user.callId && user.callId !== '') {
+        socket.leave(`monitor:${user.callId}`);
+        closeLocalMediasoup(socket.id);
+        await updateUser(socket.id, { callId: '' });
+        console.log(`[admin] 🔇 ${user.username} stopped monitoring callId=${user.callId}`);
+      }
+    });
+
+    // ── HANGUP ────────────────────────────────────────────────────────────
+    socket.on('hangup', async () => {
+      console.log(`[hangup] 📱 Hangup requested by socket=${socket.id}`);
+      await endCall(socket);
+    });
+
+    // ── DISCONNECT (with grace period) ────────────────────────────────────
+    socket.on('disconnect', async () => {
       m.disconnectionsCounter.inc();
       console.log(`[disconnect] 🔌 Socket ${socket.id} disconnecting...`);
-      endCall(socket);
-      if (activeUsers.has(socket.id)) {
-        console.log(`[disconnect] User disconnected: ${activeUsers.get(socket.id).username} (${socket.id})`);
-        activeUsers.delete(socket.id);
-        broadcastPresence();
+
+      const user = await getUser(socket.id);
+      if (!user) return;
+
+      if (user.role === 'admin') {
+        // Admin disconnecting — just clean up monitoring, never end the call
+        if (user.callId && user.callId !== '') {
+          socket.leave(`monitor:${user.callId}`);
+          closeLocalMediasoup(socket.id);
+          console.log(`[disconnect] Admin ${user.username} stopped monitoring callId=${user.callId}`);
+        }
+        await removeFromPresence('admin', socket.id);
+        await deleteUser(socket.id);
+        return;
+      }
+
+      if (user.callId && user.callId !== '') {
+        // User was in a call — start grace period instead of immediate cleanup
+        console.log(`[disconnect] ⏱️  Starting ${GRACE_PERIOD_SECONDS}s grace period for ${user.username} (callId=${user.callId})`);
+
+        await updateUser(socket.id, {
+          status: 'disconnected',
+          disconnectedAt: String(Date.now()),
+        });
+
+        await setGracePeriod(socket.id, user.callId);
+
+        // Broadcast updated presence so other users see this user as offline
+        await broadcastPresence();
+
+        // Notify the other party that this user may reconnect
+        const call = await getCall(user.callId);
+        if (call) {
+          const otherSocketId = call.agentSocketId === socket.id
+            ? call.customerSocketId
+            : call.agentSocketId;
+
+          if (otherSocketId) {
+            const otherSocket = io.sockets.sockets.get(otherSocketId);
+            if (otherSocket) {
+              otherSocket.emit('participantDisconnected', {
+                userId: socket.id,
+                username: user.username,
+                gracePeriod: GRACE_PERIOD_SECONDS,
+              });
+            }
+          }
+        }
+      } else {
+        // Not in a call — immediate cleanup
+        console.log(`[disconnect] User disconnected: ${user.username} (${socket.id})`);
+        await removeFromPresence(user.role, socket.id);
+        await deleteUser(socket.id);
+        await broadcastPresence();
       }
     });
   });
 
-  function endCall(socket) {
-    const callId = socket._callId;
-    if (!callId || !calls[callId]) return;
-    const call = calls[callId];
-
-    // Record call duration and update counters
-    let durationSec = 0;
-    if (call.startTime) {
-      durationSec = (Date.now() - call.startTime) / 1000;
-      m.callDurationHistogram.observe(durationSec);
-    }
-    m.callsEndedCounter.inc();
-    m.activeCallsGauge.dec();
-
-    console.log(`[endCall] 🛑 callId=${callId} ended (duration: ${durationSec.toFixed(1)}s)`);
-
-    // Log cleanup details
-    const other = socket === call.agentSocket ? call.customerSocket : call.agentSocket;
-
-    console.log(`[endCall]    Caller socket=${socket.id}: producer=${!!socket._producer} consumer=${!!socket._consumer} sendT=${!!socket._sendTransport} recvT=${!!socket._recvTransport}`);
-    if (other) {
-      console.log(`[endCall]    Other  socket=${other.id}: producer=${!!other._producer} consumer=${!!other._consumer} sendT=${!!other._sendTransport} recvT=${!!other._recvTransport}`);
-    }
-
-    // Notify the other party
-    other?.emit('callEnded');
-
-    // Unbind call IDs
-    if (call.agentSocket) call.agentSocket._callId = null;
-    if (call.customerSocket) call.customerSocket._callId = null;
-
-    // Clean up mediasoup resources for caller
-    try { socket._producer?.close(); } catch (_) { }
-    try { socket._consumer?.close(); } catch (_) { }
-    try { socket._sendTransport?.close(); } catch (_) { }
-    try { socket._recvTransport?.close(); } catch (_) { }
-    socket._producer = socket._consumer = socket._sendTransport = socket._recvTransport = null;
-
-    // Clean up mediasoup resources for other party
-    if (other) {
-      try { other._producer?.close(); } catch (_) { }
-      try { other._consumer?.close(); } catch (_) { }
-      try { other._sendTransport?.close(); } catch (_) { }
-      try { other._recvTransport?.close(); } catch (_) { }
-      other._producer = other._consumer = other._sendTransport = other._recvTransport = null;
-    }
-
-    delete calls[callId];
-    console.log(`[endCall] 🧹 Cleaned up all resources for callId=${callId}`);
-  }
-
+  // ── Express routes ─────────────────────────────────────────────────────────
   app.get('/', (_req, res) => {
-    res.json({ message: 'Mediasoup server is running.' });
+    res.json({ message: 'Mediasoup server is running.', redis: 'connected' });
   });
 
   // ── Prometheus scrape endpoint ────────────────────────────────────────────
@@ -419,11 +810,33 @@ async function main() {
     res.end(await register.metrics());
   });
 
+  // ── Redis health endpoint ─────────────────────────────────────────────────
+  app.get('/redis-health', async (_req, res) => {
+    try {
+      const { getRedis } = require('./redisState');
+      const r = getRedis();
+      const pong = await r.ping();
+      const userCount = await r.keys('user:*');
+      const callCount = await r.keys('call:*');
+      const graceCount = await r.keys('grace:*');
+      res.json({
+        status: 'ok',
+        ping: pong,
+        users: userCount.length,
+        activeCalls: callCount.length,
+        gracePeriods: graceCount.length,
+      });
+    } catch (err) {
+      res.status(500).json({ status: 'error', message: err.message });
+    }
+  });
+
   // ── Immediate snapshot on startup + periodic console logging ─────────────
   startPeriodicLog();
   server.listen(3000, () => {
     console.log('Server running on port 3000');
     console.log('Prometheus metrics available at http://localhost:3000/metrics');
+    console.log('Redis health available at http://localhost:3000/redis-health');
     // Print an initial snapshot right away so the first log isn't 60s away
     printMetricsSnapshot();
   });
