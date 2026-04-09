@@ -1,10 +1,10 @@
 :root {
-  --bg-color: #f8fafc;
-  --surface-color: #ffffff;
-  --primary-color: #3b82f6;
-  --primary-hover: #2563eb;
-  --text-primary: #0f172a;
-  --text-secondary: #64748b;
+  --bg-color: #0f1115;
+  --surface-color: #1a1d24;
+  --primary-color: #6366f1;
+  --primary-hover: #4f46e5;
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
   --success-color: #10b981;
   --danger-color: #ef4444;
   
@@ -24,7 +24,7 @@ body {
   display: flex;
   justify-content: center;
   align-items: center;
-  background: radial-gradient(circle at top right, #e0e7ff, #f8fafc);
+  background: radial-gradient(circle at top right, #1f1b40, #0f1115);
 }
 
 .login-container {
@@ -40,15 +40,15 @@ body {
   border-radius: 24px;
   width: 100%;
   max-width: 400px;
-  box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.1);
-  border: 1px solid rgba(0, 0, 0, 0.05);
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.05);
   text-align: center;
 }
 
 .login-box h2 {
   font-size: 28px;
   margin-bottom: 8px;
-  background: linear-gradient(135deg, #3b82f6, #06b6d4);
+  background: linear-gradient(135deg, #a855f7, #6366f1);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
@@ -56,25 +56,102 @@ body {
 .login-box p {
   color: var(--text-secondary);
   font-size: 14px;
-  margin-bottom: 32px;
+  margin-bottom: 24px;
 }
 
 .login-box input {
+  margin-bottom: 16px;
+  width: 100%;
+}
+
+.login-box button[type="submit"] {
+  width: 100%;
+  margin-top: 8px;
+}
+
+/* Auth tabs */
+.auth-tabs {
+  display: flex;
+  gap: 0;
   margin-bottom: 24px;
-  width: 100%;
-  border: 1px solid #cbd5e1;
-  background: white;
-  color: #0f172a;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 12px;
+  padding: 4px;
 }
 
-.login-box input:focus {
-  border-color: #3b82f6;
+.auth-tab {
+  flex: 1;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
 }
 
-.login-box button {
-  width: 100%;
+.auth-tab:hover {
+  color: var(--text-primary);
+  background: transparent;
+  transform: none;
 }
 
+.auth-tab.active {
+  background: var(--primary-color);
+  color: white;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+}
+
+.auth-tab.active:hover {
+  background: var(--primary-color);
+}
+
+/* Auth error */
+.auth-error {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  margin-bottom: 16px;
+  text-align: left;
+}
+
+/* Loading spinner */
+.loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid rgba(255, 255, 255, 0.1);
+  border-top-color: var(--primary-color);
+  border-radius: 50%;
+  margin: 0 auto;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Logout button */
+.logout-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  padding: 8px 16px;
+  font-size: 13px;
+  border-radius: 8px;
+  margin-top: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.logout-btn:hover {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.3);
+  transform: none;
+}
 
 .app-container {
   width: 100%;
@@ -82,8 +159,8 @@ body {
   background: var(--surface-color);
   border-radius: 24px;
   padding: 32px;
-  box-shadow: 0 20px 40px -10px rgba(0, 0, 0, 0.1);
-  border: 1px solid rgba(0, 0, 0, 0.05);
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .header {
@@ -95,7 +172,7 @@ body {
   font-size: 24px;
   font-weight: 700;
   margin-bottom: 8px;
-  background: linear-gradient(135deg, #3b82f6, #06b6d4);
+  background: linear-gradient(135deg, #a855f7, #6366f1);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
@@ -122,7 +199,7 @@ body {
 }
 
 .card {
-  background: #f1f5f9;
+  background: rgba(255, 255, 255, 0.03);
   border-radius: 16px;
   padding: 24px;
   margin-bottom: 24px;
@@ -130,7 +207,7 @@ body {
 }
 
 .card:hover {
-  background: #e2e8f0;
+  background: rgba(255, 255, 255, 0.05);
   transform: translateY(-2px);
 }
 
@@ -138,13 +215,13 @@ body {
   font-size: 16px;
   margin-bottom: 16px;
   color: var(--text-secondary);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 input {
   flex: 1;
-  background: white;
-  border: 1px solid #cbd5e1;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 12px;
   padding: 12px 16px;
   color: var(--text-primary);
@@ -182,6 +259,12 @@ button:active {
   transform: translateY(1px);
 }
 
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
 button.success {
   background: var(--success-color);
 }
@@ -200,7 +283,6 @@ button.danger:hover {
 .incoming-call {
   animation: pulse 2s infinite;
   border: 1px solid var(--primary-color);
-  background: white;
 }
 
 .incoming-call-actions {
@@ -214,9 +296,9 @@ button.danger:hover {
 }
 
 @keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
-  70% { box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+  0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.4); }
+  70% { box-shadow: 0 0 0 10px rgba(99, 102, 241, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
 }
 
 .call-active-state {
@@ -229,21 +311,19 @@ button.danger:hover {
   font-weight: 300;
   margin: 16px 0 32px;
   font-variant-numeric: tabular-nums;
-  color: var(--text-primary);
 }
 
 .avatar {
   width: 80px;
   height: 80px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #0ea5e9, #3b82f6);
+  background: linear-gradient(135deg, #4f46e5, #ec4899);
   margin: 0 auto 16px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 24px;
   font-weight: bold;
-  color: white;
 }
 
 .user-list {
@@ -257,10 +337,10 @@ button.danger:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: white;
+  background: rgba(0,0,0,0.2);
   padding: 12px 16px;
   border-radius: 12px;
-  border: 1px solid #e2e8f0;
+  border: 1px solid rgba(255,255,255,0.05);
 }
 
 .user-info {
@@ -271,7 +351,6 @@ button.danger:hover {
 .user-name {
   font-weight: 600;
   font-size: 15px;
-  color: var(--text-primary);
 }
 
 .user-role {
@@ -281,12 +360,10 @@ button.danger:hover {
 
 .dial-btn {
   padding: 8px 16px;
-  background: #e2e8f0;
-  color: #334155;
+  background: rgba(255,255,255,0.1);
   border-radius: 8px;
 }
 
 .dial-btn:hover {
   background: var(--primary-color);
-  color: white;
 }

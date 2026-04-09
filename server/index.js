@@ -33,12 +33,31 @@ const {
   subscribeToExpirations,
 } = require('./redisState');
 const { attachHeartbeat } = require('./heartbeat');
+const { registerUser, loginUser, verifyToken } = require('./auth');
+const { createPool, initDatabase } = require('./db');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+
+// ── Socket.IO Authentication Middleware ───────────────────────────────────────
+// Every socket connection MUST provide a valid JWT token.
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    return next(new Error('Authentication required. Please login first.'));
+  }
+  const decoded = verifyToken(token);
+  if (!decoded) {
+    return next(new Error('Invalid or expired token. Please login again.'));
+  }
+  // Attach user info to the socket for use in all event handlers
+  socket.user = decoded; // { userId, username, role }
+  next();
+});
 
 // ── Local mediasoup transport/producer/consumer refs ──────────────────────────
 // These are C++ objects that cannot be serialised into Redis and MUST live in
@@ -224,6 +243,10 @@ async function endCall(socket) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // 0. Initialize MySQL database
+  createPool();
+  await initDatabase();
+
   // 1. Connect to Redis and clean stale state
   createRedisClients();
   await cleanupStaleState();
@@ -241,27 +264,24 @@ async function main() {
   // 4. Socket.IO connection handler
   io.on('connection', async (socket) => {
     m.connectionsCounter.inc();
-    const { role, username } = socket.handshake.query;
+    // User info is guaranteed by the auth middleware
+    const { role, username } = socket.user;
 
-    if (role && username) {
-      console.log(`[connect] ✅ ${role} connected: ${username} (${socket.id})`);
+    console.log(`[connect] ✅ ${role} connected: ${username} (${socket.id})`);
 
-      await setUser(socket.id, { username, role, status: 'connected' });
-      await addToPresence(role, socket.id);
+    await setUser(socket.id, { username, role, status: 'connected' });
+    await addToPresence(role, socket.id);
 
-      if (role === 'agent') {
-        socket.join('agents');
-      } else if (role === 'customer') {
-        socket.join('customers');
-      } else if (role === 'admin') {
-        socket.join('admins');
-      }
-
-      // Admins don't appear in agent/customer presence — only broadcast for agents & customers
-      await broadcastPresence();
-    } else {
-      console.warn(`[connect] ⚠️  Socket ${socket.id} connected without role/username`);
+    if (role === 'agent') {
+      socket.join('agents');
+    } else if (role === 'customer') {
+      socket.join('customers');
+    } else if (role === 'admin') {
+      socket.join('admins');
     }
+
+    // Admins don't appear in agent/customer presence — only broadcast for agents & customers
+    await broadcastPresence();
 
     // Attach application-level heartbeat
     attachHeartbeat(socket, async (timedOutSocket) => {
@@ -802,6 +822,46 @@ async function main() {
   // ── Express routes ─────────────────────────────────────────────────────────
   app.get('/', (_req, res) => {
     res.json({ message: 'Mediasoup server is running.', redis: 'connected' });
+  });
+
+  // ── Auth REST endpoints ───────────────────────────────────────────────────
+  app.post('/api/register', async (req, res) => {
+    try {
+      const { username, phone, password, role } = req.body;
+      if (!username || !phone || !password || !role) {
+        return res.status(400).json({ error: 'All fields are required: username, phone, password, role.' });
+      }
+      const result = await registerUser(username, phone, password, role);
+      console.log(`[auth] ✅ Registered user: ${result.username} (${result.role}) phone=${result.phone}`);
+      res.json(result);
+    } catch (err) {
+      console.error(`[auth] ❌ Register failed:`, err.message);
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/login', async (req, res) => {
+    try {
+      const { phone, password } = req.body;
+      if (!phone || !password) {
+        return res.status(400).json({ error: 'Phone and password are required.' });
+      }
+      const result = await loginUser(phone, password);
+      console.log(`[auth] ✅ Login: ${result.username} (${result.role}) phone=${result.phone}`);
+      res.json(result);
+    } catch (err) {
+      console.error(`[auth] ❌ Login failed:`, err.message);
+      res.status(401).json({ error: err.message });
+    }
+  });
+
+  // Verify token endpoint (for frontend auto-login check)
+  app.post('/api/verify-token', (req, res) => {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ valid: false });
+    const decoded = verifyToken(token);
+    if (!decoded) return res.status(401).json({ valid: false });
+    res.json({ valid: true, user: { userId: decoded.userId, username: decoded.username, role: decoded.role } });
   });
 
   // ── Prometheus scrape endpoint ────────────────────────────────────────────
