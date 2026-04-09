@@ -21,6 +21,38 @@ function clearSession() {
   localStorage.removeItem(STORAGE_KEY);
 }
 
+/* ── Helpers ─────────────────────────────────────────────────────────────── */
+function fmtDuration(sec) {
+  if (!sec || sec <= 0) return '—';
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}m ${s}s`;
+}
+
+function fmtDateTime(dt) {
+  if (!dt) return '—';
+  const d = new Date(dt);
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function StatusBadge({ status }) {
+  const colors = {
+    completed: { bg: 'rgba(16,185,129,0.15)', color: '#34d399', label: 'Completed' },
+    missed:    { bg: 'rgba(251,191,36,0.15)', color: '#fbbf24', label: 'Missed' },
+    rejected:  { bg: 'rgba(239,68,68,0.15)',  color: '#f87171', label: 'Rejected' },
+  };
+  const c = colors[status] || colors.missed;
+  return (
+    <span style={{
+      background: c.bg, color: c.color,
+      padding: '2px 8px', borderRadius: '12px', fontSize: '11px', fontWeight: 600,
+    }}>{c.label}</span>
+  );
+}
+
 function App() {
   // Auth state
   const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
@@ -44,9 +76,40 @@ function App() {
   const [peerDisconnected, setPeerDisconnected] = useState(null);
   const [activeCustomers, setActiveCustomers] = useState([]);
 
+  // Call history state
+  const [showHistory, setShowHistory] = useState(false);
+  const [callHistory, setCallHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyTotalPages, setHistoryTotalPages] = useState(1);
+
+  // Call timer
+  const [callElapsed, setCallElapsed] = useState(0);
+  const callStartTimeRef = useRef(null);
+
   const callRef = useRef(null);
   const previousSocketId = useRef(null);
   const socketRef = useRef(null);
+
+  // Live call timer
+  useEffect(() => {
+    if (activeCall && activeCall.state === 'Connected') {
+      if (!callStartTimeRef.current) callStartTimeRef.current = Date.now();
+      const interval = setInterval(() => {
+        setCallElapsed(Math.floor((Date.now() - callStartTimeRef.current) / 1000));
+      }, 1000);
+      return () => clearInterval(interval);
+    } else if (!activeCall) {
+      callStartTimeRef.current = null;
+      setCallElapsed(0);
+    }
+  }, [activeCall?.state, activeCall]);
+
+  const fmtTimer = (sec) => {
+    const m = String(Math.floor(sec / 60)).padStart(2, '0');
+    const s = String(sec % 60).padStart(2, '0');
+    return `${m}:${s}`;
+  };
 
   // On mount: check for existing session in localStorage
   useEffect(() => {
@@ -79,6 +142,31 @@ function App() {
       connectSocket(session);
     }
   }, [session]);
+
+  // Fetch call history when toggled
+  useEffect(() => {
+    if (showHistory && session) fetchHistory();
+  }, [showHistory, historyPage]);
+
+  const fetchHistory = async () => {
+    if (!session) return;
+    setHistoryLoading(true);
+    try {
+      const params = new URLSearchParams({ page: historyPage, limit: 10 });
+      const res = await fetch(`${SERVER_URL}/api/my-calls?${params}`, {
+        headers: { Authorization: `Bearer ${session.token}` },
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setCallHistory(data.rows || []);
+        setHistoryTotalPages(data.totalPages || 1);
+      }
+    } catch (err) {
+      console.error('[agent] Failed to fetch call history:', err);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
 
   const handleRegister = async (e) => {
     e.preventDefault();
@@ -287,6 +375,13 @@ function App() {
     });
   };
 
+  const declineCall = () => {
+    if (!incomingCall) return;
+    // Notify server this call was rejected
+    socket.emit('rejectCall', { callId: incomingCall.callId });
+    setIncomingCall(null);
+  };
+
   const dialCustomer = (customerId, customerName) => {
     socket.emit('dialOut', { targetId: customerId }, (res) => {
       if (res.error) return alert(res.error);
@@ -411,68 +506,123 @@ function App() {
   }
 
   return (
-    <div className="app-container">
-      <div className="header">
-        <h1>Agent Portal</h1>
-        <div className="status">
-          <div className={`status-indicator ${connected ? 'connected' : reconnecting ? 'reconnecting' : ''}`}></div>
-          {reconnecting
-            ? 'Reconnecting...'
-            : connected
-              ? `Connected as ${session.username}`
-              : 'Connecting...'}
+    <div className="app-shell">
+      {/* ── Top Bar ────────────────────────────────────────────────────── */}
+      <header className="topbar">
+        <div className="topbar-left">
+          <span className="topbar-title">Agent Portal</span>
+          <div className="topbar-status">
+            <span className={`status-dot ${connected ? 'online' : ''}`}></span>
+            {reconnecting ? 'Reconnecting...' : connected ? session.username : 'Connecting...'}
+          </div>
         </div>
         <button className="logout-btn" onClick={handleLogout}>Logout</button>
-      </div>
+      </header>
 
       {!activeCall ? (
         <>
-          {incomingCall && (
-            <div className="card incoming-call">
-              <div className="card-title">Incoming Call</div>
-              <div style={{ color: 'white', marginBottom: 8 }}>Call from {incomingCall.from}</div>
-              <div className="incoming-call-actions">
-                <button className="success" onClick={acceptCall}>Accept</button>
-                <button className="danger" onClick={() => setIncomingCall(null)}>Decline</button>
-              </div>
-            </div>
-          )}
+          {/* ── Nav Tabs ──────────────────────────────────────────────── */}
+          <nav className="nav-tabs">
+            <button className={`nav-tab ${!showHistory ? 'active' : ''}`} onClick={() => setShowHistory(false)}>
+              👥 Customers ({activeCustomers.length})
+            </button>
+            <button className={`nav-tab ${showHistory ? 'active' : ''}`} onClick={() => setShowHistory(true)}>
+              📋 Call History
+            </button>
+          </nav>
 
-          <div className="card roster">
-            <div className="card-title">Active Customers ({activeCustomers.length})</div>
-            {activeCustomers.length === 0 ? (
-              <p style={{ color: 'var(--text-secondary)' }}>No customers currently online.</p>
+          <div className="main-content">
+            {/* ── Incoming Call Banner ──────────────────────────────── */}
+            {incomingCall && (
+              <div className="incoming-banner">
+                <div className="incoming-header">
+                  <span className="incoming-label">📞 Incoming Call</span>
+                </div>
+                <div className="incoming-from">{incomingCall.from}</div>
+                <div className="incoming-actions">
+                  <button className="btn-accept" onClick={acceptCall}>Accept</button>
+                  <button className="btn-decline" onClick={declineCall}>Decline</button>
+                </div>
+              </div>
+            )}
+
+            {/* ── Customers Tab ─────────────────────────────────────── */}
+            {!showHistory ? (
+              <>
+                {activeCustomers.length === 0 ? (
+                  <div className="empty-state">
+                    <div className="empty-icon">👥</div>
+                    <p>No customers currently online.</p>
+                  </div>
+                ) : (
+                  <ul className="user-list">
+                    {activeCustomers.map(customer => (
+                      <li key={customer.id} className="user-card">
+                        <div className="user-info">
+                          <span className="user-name">{customer.username}</span>
+                          <span className="user-role-tag">Customer</span>
+                        </div>
+                        <button className="call-btn" onClick={() => dialCustomer(customer.id, customer.username)}>
+                          📞 Call
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
             ) : (
-              <ul className="user-list">
-                {activeCustomers.map(customer => (
-                  <li key={customer.id} className="user-item">
-                    <div className="user-info">
-                      <span className="user-name">{customer.username}</span>
-                      <span className="user-role">Customer</span>
-                    </div>
-                    <button className="dial-btn" onClick={() => dialCustomer(customer.id, customer.username)}>
-                      Call
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              /* ── History Tab ───────────────────────────────────────── */
+              <>
+                <div className="section-title">My Call History</div>
+                {historyLoading ? (
+                  <div className="empty-state"><div className="loading-spinner"></div></div>
+                ) : callHistory.length === 0 ? (
+                  <div className="empty-state">
+                    <div className="empty-icon">📋</div>
+                    <p>No calls yet.</p>
+                  </div>
+                ) : (
+                  <ul className="history-list">
+                    {callHistory.map(row => (
+                      <li key={row.id} className="history-item">
+                        <div className="history-item-main">
+                          <span className="history-peer">{row.caller_name === session.username ? (row.callee_name || '—') : (row.caller_name || '—')}</span>
+                          <StatusBadge status={row.status} />
+                        </div>
+                        <div className="history-item-meta">
+                          <span>📅 {fmtDateTime(row.started_at)}</span>
+                          <span>⏱️ {fmtDuration(row.duration_sec)}</span>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {historyTotalPages > 1 && (
+                  <div className="pagination">
+                    <button disabled={historyPage <= 1} onClick={() => setHistoryPage(p => p - 1)}>← Prev</button>
+                    <span className="page-info">Page {historyPage}/{historyTotalPages}</span>
+                    <button disabled={historyPage >= historyTotalPages} onClick={() => setHistoryPage(p => p + 1)}>Next →</button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </>
       ) : (
-        <div className="card">
-          <div className="call-active-state">
-            <div className="avatar">{activeCall.withUser.charAt(0).toUpperCase()}</div>
-            <div className="card-title">Call with {activeCall.withUser}</div>
-            <div style={{ color: 'white' }}>{activeCall.state}</div>
-            {peerDisconnected && (
-              <div style={{ color: '#ffab00', fontSize: '14px', marginTop: 4 }}>
-                ⚠️ {peerDisconnected.username} disconnected — waiting {peerDisconnected.gracePeriod}s for reconnection...
-              </div>
-            )}
-            <div className="call-timer">00:00</div>
-            <button className="danger" onClick={endCall}>End Call</button>
+        /* ── Active Call Screen ──────────────────────────────────────── */
+        <div className="call-screen">
+          <div className="call-avatar">{activeCall.withUser.charAt(0).toUpperCase()}</div>
+          <div className="call-with-name">{activeCall.withUser}</div>
+          <div className={`call-state ${activeCall.state !== 'Connected' ? 'ringing' : ''}`}>
+            {activeCall.state}
           </div>
+          {peerDisconnected && (
+            <div className="call-warning">
+              ⚠️ {peerDisconnected.username} disconnected — waiting {peerDisconnected.gracePeriod}s...
+            </div>
+          )}
+          <div className="call-timer">{fmtTimer(callElapsed)}</div>
+          <button className="hangup-btn" onClick={endCall}>End Call</button>
         </div>
       )}
     </div>

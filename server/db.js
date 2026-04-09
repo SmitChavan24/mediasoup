@@ -68,6 +68,32 @@ async function initDatabase() {
     }
 
     console.log('[db] ✅ users table ready');
+
+    // ── call_history table ───────────────────────────────────────────────
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS call_history (
+        id           INT AUTO_INCREMENT PRIMARY KEY,
+        call_id      VARCHAR(64) NOT NULL,
+        caller_id    INT NULL,
+        caller_name  VARCHAR(50),
+        caller_role  ENUM('agent','customer'),
+        callee_id    INT NULL,
+        callee_name  VARCHAR(50),
+        callee_role  ENUM('agent','customer'),
+        status       ENUM('completed','missed','rejected') DEFAULT 'missed',
+        started_at   DATETIME NOT NULL,
+        answered_at  DATETIME NULL,
+        ended_at     DATETIME NULL,
+        duration_sec INT DEFAULT 0,
+        call_date    DATE GENERATED ALWAYS AS (DATE(started_at)) STORED,
+        INDEX idx_call_id (call_id),
+        INDEX idx_caller (caller_id),
+        INDEX idx_callee (callee_id),
+        INDEX idx_date (call_date),
+        INDEX idx_status (status)
+      )
+    `);
+    console.log('[db] ✅ call_history table ready');
   } finally {
     conn.release();
   }

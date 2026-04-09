@@ -35,6 +35,7 @@ const {
 const { attachHeartbeat } = require('./heartbeat');
 const { registerUser, loginUser, verifyToken } = require('./auth');
 const { createPool, initDatabase } = require('./db');
+const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername } = require('./callHistory');
 
 const app = express();
 app.use(cors());
@@ -63,8 +64,8 @@ io.use((socket, next) => {
 // These are C++ objects that cannot be serialised into Redis and MUST live in
 // the same process.  We index them by socket.id so we can clean them up.
 const localTransports = {};   // socketId → { sendTransport, recvTransport }
-const localProducers  = {};   // socketId → producer
-const localConsumers  = {};   // socketId → consumer
+const localProducers = {};   // socketId → producer
+const localConsumers = {};   // socketId → consumer
 
 // ── Per-call router mapping ──────────────────────────────────────────────────
 // Each call MUST use a single router for all its transports (send/recv for both
@@ -136,6 +137,16 @@ async function fullCleanup(socketId) {
 
       console.log(`[endCall] 🛑 callId=${callId} ended (duration: ${durationSec.toFixed(1)}s)`);
 
+      // ── Persist call history (fullCleanup path) ──────────────────────
+      try {
+        await updateCallRecord(callId, {
+          ended_at: true,
+          duration_sec: durationSec,
+        });
+      } catch (err) {
+        console.error(`[fullCleanup] ❌ Failed to update call history:`, err);
+      }
+
       // Notify any admins monitoring this call
       io.to(`monitor:${callId}`).emit('callEnded');
       // Clean up monitoring admins' mediasoup resources
@@ -200,6 +211,16 @@ async function endCall(socket) {
   m.activeCallsGauge.dec();
 
   console.log(`[endCall] 🛑 callId=${callId} ended (duration: ${durationSec.toFixed(1)}s)`);
+
+  // ── Persist call history ──────────────────────────────────────────────
+  try {
+    await updateCallRecord(callId, {
+      ended_at: true,
+      duration_sec: durationSec,
+    });
+  } catch (err) {
+    console.error(`[endCall] ❌ Failed to update call history:`, err);
+  }
 
   // Find the other party
   const otherSocketId = call.agentSocketId === socket.id
@@ -598,6 +619,20 @@ async function main() {
 
       console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetId} | callId=${callId}`);
 
+      // ── Persist call history ──────────────────────────────────────────
+      const targetUser = await getUser(targetId);
+      try {
+        await insertCallRecord({
+          callId,
+          callerName: callerUser.username,
+          callerRole: callerUser.role,
+          calleeName: targetUser?.username || null,
+          calleeRole: targetUser?.role || null,
+        });
+      } catch (err) {
+        console.error(`[dialOut] ❌ Failed to insert call history:`, err);
+      }
+
       targetSocket.emit('incomingCall', {
         callId,
         from: callerUser.username,
@@ -631,6 +666,19 @@ async function main() {
 
       console.log(`[callIn] 📞 General queue call from: ${callerUser.username} | callId=${callId}`);
 
+      // ── Persist call history ──────────────────────────────────────────
+      try {
+        await insertCallRecord({
+          callId,
+          callerName: callerUser.username,
+          callerRole: 'customer',
+          calleeName: null,
+          calleeRole: null,
+        });
+      } catch (err) {
+        console.error(`[callIn] ❌ Failed to insert call history:`, err);
+      }
+
       // Notify all agents
       io.to('agents').emit('incomingCall', {
         callId,
@@ -660,6 +708,24 @@ async function main() {
 
       console.log(`[acceptCall] ✅ Call ${callId} accepted by socket=${socket.id} (${user.role})`);
 
+      // Mark as accepted in Redis so admin sees 'Connected'
+      await updateCall(callId, { accepted: 'true' });
+      io.to('admins').emit('callsUpdated');
+
+      // ── Update call history: mark accepted ──────────────────────────────
+      try {
+        const historyUpdate = { status: 'completed', answered_at: true };
+        // For callIn, fill callee info now that we know who answered
+        if (user.role === 'agent' && !call.agentSocketId) {
+          historyUpdate.callee_name = user.username;
+          historyUpdate.callee_role = 'agent';
+          historyUpdate.callee_id = await getUserIdByUsername(user.username);
+        }
+        await updateCallRecord(callId, historyUpdate);
+      } catch (err) {
+        console.error(`[acceptCall] ❌ Failed to update call history:`, err);
+      }
+
       // Tell the other party to start setupCall too
       const updatedCall = await getCall(callId);
       const otherSocketId = socket.id === updatedCall.agentSocketId
@@ -679,6 +745,20 @@ async function main() {
       }
 
       cb({ callId });
+    });
+
+    // ── REJECT CALL ──────────────────────────────────────────────────────
+    socket.on('rejectCall', async ({ callId }, cb) => {
+      try {
+        await updateCallRecord(callId, {
+          status: 'rejected',
+          ended_at: true,
+        });
+        console.log(`[rejectCall] ❌ Call ${callId} rejected by socket=${socket.id}`);
+      } catch (err) {
+        console.error(`[rejectCall] ❌ Failed to update call history:`, err);
+      }
+      if (typeof cb === 'function') cb({ ok: true });
     });
 
     // Request presence on explicit call
@@ -862,6 +942,60 @@ async function main() {
     const decoded = verifyToken(token);
     if (!decoded) return res.status(401).json({ valid: false });
     res.json({ valid: true, user: { userId: decoded.userId, username: decoded.username, role: decoded.role } });
+  });
+
+  // ── Call History REST Endpoints ──────────────────────────────────────────
+
+  // JWT auth middleware for REST routes
+  function authMiddleware(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Authorization header required.' });
+    }
+    const decoded = verifyToken(authHeader.slice(7));
+    if (!decoded) return res.status(401).json({ error: 'Invalid or expired token.' });
+    req.user = decoded;
+    next();
+  }
+
+  // Admin: full call history with filters & pagination
+  app.get('/api/call-history', authMiddleware, async (req, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Admin access required.' });
+      }
+      const result = await getCallHistory({
+        userId: req.query.userId || null,
+        status: req.query.status || null,
+        from: req.query.from || null,
+        to: req.query.to || null,
+        search: req.query.search || null,
+        page: req.query.page || 1,
+        limit: req.query.limit || 20,
+      });
+      res.json(result);
+    } catch (err) {
+      console.error('[api] ❌ GET /api/call-history failed:', err);
+      res.status(500).json({ error: 'Failed to fetch call history.' });
+    }
+  });
+
+  // Agent / Customer: own call history
+  app.get('/api/my-calls', authMiddleware, async (req, res) => {
+    try {
+      const result = await getCallHistory({
+        userId: req.user.userId,
+        status: req.query.status || null,
+        from: req.query.from || null,
+        to: req.query.to || null,
+        page: req.query.page || 1,
+        limit: req.query.limit || 20,
+      });
+      res.json(result);
+    } catch (err) {
+      console.error('[api] ❌ GET /api/my-calls failed:', err);
+      res.status(500).json({ error: 'Failed to fetch call history.' });
+    }
   });
 
   // ── Prometheus scrape endpoint ────────────────────────────────────────────

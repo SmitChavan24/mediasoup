@@ -144,6 +144,7 @@ async function setCall(callId, { agentSocketId, customerSocketId, routerIndex, s
     customerSocketId: customerSocketId || '',
     routerIndex: String(routerIndex),
     startTime: String(startTime),
+    accepted: 'false',
   });
 }
 
@@ -206,6 +207,7 @@ async function getAllActiveCalls() {
       agentSocketId: data.agentSocketId,
       customerSocketId: data.customerSocketId,
       startTime: parseInt(data.startTime, 10),
+      accepted: data.accepted === 'true',
     });
   }
   return calls;
