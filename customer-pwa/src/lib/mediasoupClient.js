@@ -52,16 +52,35 @@ export async function setupCall(socket, callId, onRemoteAudio) {
     ...recvParams,
     iceServers: recvParams.iceServers,
   });
+  // Wire up DTLS connect events (with guards to prevent duplicate connect)
+  let sendConnected = false;
   sendTransport.on('connect', ({ dtlsParameters }, cb, errback) => {
+    if (sendConnected) {
+      console.warn('[mediasoup] ⚠️ SEND transport connect already called — skipping duplicate');
+      return cb();
+    }
+    sendConnected = true;
     socket.emit('connectSendTransport', { dtlsParameters }, (err) => {
-      if (err) return errback(err);
+      if (err) {
+        sendConnected = false;
+        return errback(err);
+      }
       cb();
     });
   });
 
+  let recvConnected = false;
   recvTransport.on('connect', ({ dtlsParameters }, cb, errback) => {
+    if (recvConnected) {
+      console.warn('[mediasoup] ⚠️ RECV transport connect already called — skipping duplicate');
+      return cb();
+    }
+    recvConnected = true;
     socket.emit('connectRecvTransport', { dtlsParameters }, (err) => {
-      if (err) return errback(err);
+      if (err) {
+        recvConnected = false;
+        return errback(err);
+      }
       cb();
     });
   });

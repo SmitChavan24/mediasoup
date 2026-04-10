@@ -316,6 +316,17 @@ function App() {
       handleCallCleanup();
     });
 
+    s.on('callRejected', ({ rejectedBy }) => {
+      console.log(`[customer] Call rejected by ${rejectedBy}`);
+      // Remove the pending callAccepted listener since the call was rejected
+      s.off('callAccepted');
+      // Briefly show "Rejected" on the call screen before returning to main
+      setActiveCall(prev => prev ? { ...prev, state: 'Call Rejected' } : null);
+      setTimeout(() => {
+        handleCallCleanup();
+      }, 2000);
+    });
+
     s.on('participantDisconnected', ({ username: peerName, gracePeriod }) => {
       setPeerDisconnected({ username: peerName, gracePeriod });
     });
@@ -363,7 +374,15 @@ function App() {
 
   const callSpecificAgent = (agentId, agentName) => {
     socket.emit('dialOut', { targetId: agentId }, (res) => {
-      if (res.error) return alert(res.error);
+      if (res.error) {
+        if (res.busy) {
+          // Show call screen with busy state, then return to main after 3s
+          setActiveCall({ withUser: agentName, state: 'On Another Call' });
+          setTimeout(() => handleCallCleanup(), 3000);
+          return;
+        }
+        return alert(res.error);
+      }
       const { callId } = res;
       setActiveCall({ callId, withUser: agentName, state: 'Calling...' });
       socket.once('callAccepted', async () => {

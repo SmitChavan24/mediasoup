@@ -444,12 +444,20 @@ async function main() {
     socket.on('connectSendTransport', async ({ dtlsParameters }, cb) => {
       try {
         const sendTransport = localTransports[socket.id]?.sendTransport;
-        console.log(`[dtls] 🔒 connectSendTransport for socket=${socket.id} transportId=${sendTransport?.id}`);
+        if (!sendTransport) {
+          console.warn(`[dtls] ⚠️ SEND transport not found for socket=${socket.id} — skipping connect (transport may have been cleaned up)`);
+          return cb('Transport not found');
+        }
+        console.log(`[dtls] 🔒 connectSendTransport for socket=${socket.id} transportId=${sendTransport.id}`);
         console.log(`[dtls]    DTLS role: ${dtlsParameters?.role}, fingerprints: ${dtlsParameters?.fingerprints?.length || 0}`);
         await sendTransport.connect({ dtlsParameters });
         console.log(`[dtls] ✅ SEND transport connected for socket=${socket.id}`);
         cb();
       } catch (err) {
+        if (err.message && err.message.includes('connect() already called')) {
+          console.warn(`[dtls] ⚠️ SEND transport connect() already called for socket=${socket.id} — ignoring duplicate`);
+          return cb();
+        }
         console.error(`[dtls] ❌ SEND transport connect FAILED for socket=${socket.id}:`, err);
         cb(err.message);
       }
@@ -459,12 +467,20 @@ async function main() {
     socket.on('connectRecvTransport', async ({ dtlsParameters }, cb) => {
       try {
         const recvTransport = localTransports[socket.id]?.recvTransport;
-        console.log(`[dtls] 🔒 connectRecvTransport for socket=${socket.id} transportId=${recvTransport?.id}`);
+        if (!recvTransport) {
+          console.warn(`[dtls] ⚠️ RECV transport not found for socket=${socket.id} — skipping connect (transport may have been cleaned up)`);
+          return cb('Transport not found');
+        }
+        console.log(`[dtls] 🔒 connectRecvTransport for socket=${socket.id} transportId=${recvTransport.id}`);
         console.log(`[dtls]    DTLS role: ${dtlsParameters?.role}, fingerprints: ${dtlsParameters?.fingerprints?.length || 0}`);
         await recvTransport.connect({ dtlsParameters });
         console.log(`[dtls] ✅ RECV transport connected for socket=${socket.id}`);
         cb();
       } catch (err) {
+        if (err.message && err.message.includes('connect() already called')) {
+          console.warn(`[dtls] ⚠️ RECV transport connect() already called for socket=${socket.id} — ignoring duplicate`);
+          return cb();
+        }
         console.error(`[dtls] ❌ RECV transport connect FAILED for socket=${socket.id}:`, err);
         cb(err.message);
       }
@@ -477,7 +493,11 @@ async function main() {
         console.log(`[produce]    RTP codecs: ${rtpParameters?.codecs?.map(c => c.mimeType).join(', ')}`);
 
         const sendTransport = localTransports[socket.id]?.sendTransport;
-        console.log(`[produce]    sendTransport exists: ${!!sendTransport}, id=${sendTransport?.id}`);
+        if (!sendTransport) {
+          console.warn(`[produce] ⚠️ SEND transport not found for socket=${socket.id} — cannot produce (transport may have been cleaned up)`);
+          return cb({ error: 'Transport not found' });
+        }
+        console.log(`[produce]    sendTransport exists: true, id=${sendTransport.id}`);
 
         const producer = await sendTransport.produce({ kind, rtpParameters });
         localProducers[socket.id] = producer;
@@ -532,16 +552,33 @@ async function main() {
         // MUST use the same router the producer was created on
         const router = (callId && callRouters[callId]) || getAnyRouter();
 
-        const canConsume = router.canConsume({ producerId, rtpCapabilities });
-        console.log(`[consume] canConsume=${canConsume} routerId=${router?.id}`);
+        // Verify router exists
+        if (!router) {
+          console.warn(`[consume] ⚠️ No router found for callId=${callId} — cannot consume`);
+          return cb({ error: 'Router not found' });
+        }
+
+        // Check if the producer still exists before trying canConsume
+        let canConsume = false;
+        try {
+          canConsume = router.canConsume({ producerId, rtpCapabilities });
+        } catch (routerErr) {
+          console.warn(`[consume] ⚠️ canConsume check failed for producerId=${producerId}: ${routerErr.message}`);
+          return cb({ error: 'Producer not found or closed' });
+        }
+        console.log(`[consume] canConsume=${canConsume} routerId=${router.id}`);
 
         if (!canConsume) {
-          console.error(`[consume] ❌ Cannot consume: producerId=${producerId} — RTP capabilities mismatch or producer not found`);
+          console.warn(`[consume] ⚠️ Cannot consume: producerId=${producerId} — RTP capabilities mismatch or producer not found`);
           return cb({ error: 'Cannot consume' });
         }
 
         const recvTransport = localTransports[socket.id]?.recvTransport;
-        console.log(`[consume]    recvTransport exists: ${!!recvTransport}, id=${recvTransport?.id}`);
+        if (!recvTransport) {
+          console.warn(`[consume] ⚠️ RECV transport not found for socket=${socket.id} — cannot consume (transport may have been cleaned up)`);
+          return cb({ error: 'Transport not found' });
+        }
+        console.log(`[consume]    recvTransport exists: true, id=${recvTransport.id}`);
         const consumer = await recvTransport.consume({
           producerId,
           rtpCapabilities,
@@ -591,6 +628,29 @@ async function main() {
         return cb({ error: 'Target user not found or offline.' });
       }
 
+      // Check if target is already on a call
+      const targetUser = await getUser(targetId);
+      if (targetUser?.callId && targetUser.callId !== '') {
+        console.log(`[dialOut] 📵 Target ${targetUser.username} is busy (callId=${targetUser.callId})`);
+        const callerUser = await getUser(socket.id);
+
+        // Record as missed call
+        try {
+          await insertCallRecord({
+            callId,
+            callerName: callerUser?.username || null,
+            callerRole: callerUser?.role || null,
+            calleeName: targetUser.username,
+            calleeRole: targetUser.role,
+          });
+          await updateCallRecord(callId, { status: 'missed', ended_at: true });
+        } catch (err) {
+          console.error(`[dialOut] ❌ Failed to insert missed call record:`, err);
+        }
+
+        return cb({ error: `${targetUser.username} is on another call`, busy: true });
+      }
+
       const callerUser = await getUser(socket.id);
       const router = getNextRouter();
       callRouters[callId] = router;  // Store locally — C++ object can't go to Redis
@@ -620,7 +680,7 @@ async function main() {
       console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetId} | callId=${callId}`);
 
       // ── Persist call history ──────────────────────────────────────────
-      const targetUser = await getUser(targetId);
+      // targetUser already fetched above in the busy-check
       try {
         await insertCallRecord({
           callId,
@@ -749,15 +809,57 @@ async function main() {
 
     // ── REJECT CALL ──────────────────────────────────────────────────────
     socket.on('rejectCall', async ({ callId }, cb) => {
+      console.log(`[rejectCall] ❌ Call ${callId} rejected by socket=${socket.id}`);
+
+      // Update call history DB
       try {
         await updateCallRecord(callId, {
           status: 'rejected',
           ended_at: true,
         });
-        console.log(`[rejectCall] ❌ Call ${callId} rejected by socket=${socket.id}`);
       } catch (err) {
         console.error(`[rejectCall] ❌ Failed to update call history:`, err);
       }
+
+      // Get the call to find the other party (the caller)
+      const call = await getCall(callId);
+      if (call) {
+        const user = await getUser(socket.id);
+        // Determine who the caller is (the other party)
+        const callerSocketId = call.agentSocketId === socket.id
+          ? call.customerSocketId
+          : call.agentSocketId;
+
+        // Notify the caller that their call was rejected
+        if (callerSocketId) {
+          const callerSocket = io.sockets.sockets.get(callerSocketId);
+          if (callerSocket) {
+            callerSocket.emit('callRejected', {
+              callId,
+              rejectedBy: user?.username || 'Unknown',
+            });
+          }
+          // Clear caller's call state
+          closeLocalMediasoup(callerSocketId);
+          await updateUser(callerSocketId, { callId: '' });
+        }
+
+        // Clear rejector's call state
+        closeLocalMediasoup(socket.id);
+        await updateUser(socket.id, { callId: '' });
+
+        // Clean up call + router
+        delete callRouters[callId];
+        await deleteCall(callId);
+
+        // Metrics
+        m.callsEndedCounter.inc();
+        m.activeCallsGauge.dec();
+
+        // Notify admins
+        io.to('admins').emit('callsUpdated');
+      }
+
       if (typeof cb === 'function') cb({ ok: true });
     });
 
