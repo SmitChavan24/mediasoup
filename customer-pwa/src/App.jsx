@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupCall, getCurrentCallId, clearCurrentCallId, getPreviousSocketId } from './lib/mediasoupClient';
+import { ringtone } from './lib/ringtone';
 
 const SERVER_URL = '';
 const STORAGE_KEY = 'voip_customer_session';
@@ -91,6 +92,16 @@ function App() {
   const previousSocketId = useRef(null);
   const socketRef = useRef(null);
 
+  // Incoming call ringtone
+  useEffect(() => {
+    if (incomingCall) {
+      ringtone.start();
+    } else {
+      ringtone.stop();
+    }
+    return () => ringtone.stop();
+  }, [incomingCall]);
+
   // Live call timer
   useEffect(() => {
     if (activeCall && activeCall.state === 'Connected') {
@@ -140,6 +151,61 @@ function App() {
       connectSocket(session);
     }
   }, [session]);
+
+  useEffect(() => {
+    // After logging in and connecting successfully, register for Push Notifications
+    if (session && connected && 'serviceWorker' in navigator && 'PushManager' in window) {
+      registerPushProtocol();
+    }
+  }, [session, connected]);
+
+  async function registerPushProtocol() {
+    try {
+      if (Notification.permission === 'default') {
+        const perm = await Notification.requestPermission();
+        if (perm !== 'granted') return;
+      } else if (Notification.permission === 'denied') {
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.ready;
+      let subscription = await registration.pushManager.getSubscription();
+
+      if (!subscription) {
+        const vapidRes = await fetch(`${SERVER_URL}/api/vapid-public-key`);
+        const { publicKey } = await vapidRes.json();
+        const convertedVapidKey = urlBase64ToUint8Array(publicKey);
+
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: convertedVapidKey
+        });
+      }
+
+      await fetch(`${SERVER_URL}/api/push-subscribe`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.token}`
+        },
+        body: JSON.stringify(subscription)
+      });
+      console.log('[push] ✅ Registered Push Subscription on server');
+    } catch (err) {
+      console.error('[push] ❌ Push setup failed:', err);
+    }
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - base64String.length % 4) % 4);
+    const base64 = (base64String + padding).replace(/\-/g, '+').replace(/_/g, '/');
+    const rawData = window.atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; ++i) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+  }
 
   // Fetch call history when toggled
   useEffect(() => {

@@ -61,6 +61,7 @@ async function initDatabase() {
           phone VARCHAR(20) UNIQUE NOT NULL,
           password_hash VARCHAR(255) NOT NULL,
           role ENUM('agent', 'customer', 'admin') NOT NULL,
+          push_subscription JSON NULL,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           last_login TIMESTAMP NULL
         )

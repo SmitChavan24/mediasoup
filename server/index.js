@@ -41,6 +41,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const webpush = require('web-push');
+
+// Initialize Web Push with generated VAPID keys
+webpush.setVapidDetails(
+  'mailto:support@mediasoup-app.com',
+  'BIS3SfRv_zL4c4e6LEQqD7r4x3gBbHxnGX_TUXQ0DfXXOLsov4LmKGaMiNPTXvCR1Xlkcc4wTQFe_67XcOXrgkM',
+  'HMzH48TX5r1xlJbJZO4zy9defFVLcKQhUTZthr8MHVA'
+);
+
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
@@ -73,8 +82,21 @@ const localConsumers = {};   // socketId → consumer
 // local map.  The router is assigned once when the call is created (dialOut /
 // callIn) and reused for every createTransport / consume within that call.
 const callRouters = {};       // callId → router
+const pendingRings = {};      // callId → { interval, sub, targetDbId }
+const globalOfflineTargets = {}; // targetDbId → { callId, callerUsername, callerRole, targetRole }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+function clearPendingRings(callId) {
+  if (callId && pendingRings[callId]) {
+    clearInterval(pendingRings[callId].interval);
+    webpush.sendNotification(pendingRings[callId].sub, JSON.stringify({ type: 'cancelCall' })).catch(() => { });
+    if (pendingRings[callId].targetDbId) {
+      delete globalOfflineTargets[pendingRings[callId].targetDbId];
+    }
+    delete pendingRings[callId];
+  }
+}
 
 async function broadcastPresence() {
   const [agents, customers] = await Promise.all([
@@ -158,6 +180,7 @@ async function fullCleanup(socketId) {
         }
       }
 
+      clearPendingRings(callId);
       delete callRouters[callId];
       await deleteCall(callId);
     }
@@ -241,6 +264,10 @@ async function endCall(socket) {
   closeLocalMediasoup(socket.id);
   await updateUser(socket.id, { callId: '' });
 
+  // Clear push loop
+  clearPendingRings(callId);
+  await updateUser(socket.id, { callId: '' });
+
   // Notify any admins monitoring this call
   io.to(`monitor:${callId}`).emit('callEnded');
   const monitorRoom = io.sockets.adapter.rooms.get(`monitor:${callId}`);
@@ -299,6 +326,43 @@ async function main() {
       socket.join('customers');
     } else if (role === 'admin') {
       socket.join('admins');
+    }
+
+    // ── Check Offline Call Handoff ──────────────────────────────────────────
+    // If this user was dialed while offline, immediately alert them!
+    const userDbId = socket.user.id;
+    if (userDbId && globalOfflineTargets[userDbId]) {
+      const offlinePending = globalOfflineTargets[userDbId];
+
+      // Assign the call to this specific socket!
+      await updateUser(socket.id, { callId: offlinePending.callId });
+
+      const updates = offlinePending.targetRole === 'customer'
+        ? { customerSocketId: socket.id }
+        : { agentSocketId: socket.id };
+      await updateCall(offlinePending.callId, updates);
+
+      // Alert the user's frontend UI
+      socket.emit('incomingCall', {
+        callId: offlinePending.callId,
+        from: offlinePending.callerUsername,
+        role: offlinePending.callerRole
+      });
+
+      // Clear the OS push loop so their phone stops buzzing natively
+      clearPendingRings(offlinePending.callId);
+
+      // Alert the Caller UI that the target has opened the app!
+      const activeCall = await getCall(offlinePending.callId);
+      if (activeCall) {
+        const callerSocketId = offlinePending.targetRole === 'customer' ? activeCall.agentSocketId : activeCall.customerSocketId;
+        if (callerSocketId) {
+          const callerSocket = io.sockets.sockets.get(callerSocketId);
+          if (callerSocket) callerSocket.emit('callStateUpdate', 'Calling...');
+        }
+      }
+
+      delete globalOfflineTargets[userDbId];
     }
 
     // Admins don't appear in agent/customer presence — only broadcast for agents & customers
@@ -619,36 +683,54 @@ async function main() {
     // ── CALL INITIATION ───────────────────────────────────────────────────
 
     // Any-to-Any Direct Dial (Agent->Customer or Customer->Agent)
-    socket.on('dialOut', async ({ targetId }, cb) => {
+    socket.on('dialOut', async ({ targetId, targetUserId }, cb) => {
       const callId = `call_${Date.now()}`;
-      const targetSocket = io.sockets.sockets.get(targetId);
 
-      if (!targetSocket) {
-        console.warn(`[dialOut] ⚠️  Target ${targetId} not found or offline`);
-        return cb({ error: 'Target user not found or offline.' });
+      let targetSocket = null;
+      let targetDbId = targetUserId;
+      let targetUsername = 'Unknown';
+      let targetRole = 'customer';
+
+      // Find by given socket.id (legacy)
+      if (targetId) {
+        targetSocket = io.sockets.sockets.get(targetId);
+        if (targetSocket) {
+          targetDbId = targetSocket.user?.userId;
+          targetUsername = targetSocket.user?.username;
+          targetRole = targetSocket.user?.role;
+        }
+      }
+      // If passing DbId (offline calling scenario) search across active sockets
+      else if (targetDbId) {
+        for (const [id, s] of io.sockets.sockets.entries()) {
+          if (s.user?.userId === targetDbId) {
+            targetSocket = s;
+            targetId = id;
+            targetUsername = s.user?.username;
+            targetRole = s.user?.role;
+            break;
+          }
+        }
       }
 
-      // Check if target is already on a call
-      const targetUser = await getUser(targetId);
-      if (targetUser?.callId && targetUser.callId !== '') {
-        console.log(`[dialOut] 📵 Target ${targetUser.username} is busy (callId=${targetUser.callId})`);
-        const callerUser = await getUser(socket.id);
-
-        // Record as missed call
-        try {
-          await insertCallRecord({
-            callId,
-            callerName: callerUser?.username || null,
-            callerRole: callerUser?.role || null,
-            calleeName: targetUser.username,
-            calleeRole: targetUser.role,
-          });
-          await updateCallRecord(callId, { status: 'missed', ended_at: true });
-        } catch (err) {
-          console.error(`[dialOut] ❌ Failed to insert missed call record:`, err);
+      // Check if target is already on a call via active socket presence
+      if (targetId) {
+        const activeTargetUser = await getUser(targetId);
+        if (activeTargetUser?.callId && activeTargetUser.callId !== '') {
+          console.log(`[dialOut] 📵 Target ${activeTargetUser.username} is busy (callId=${activeTargetUser.callId})`);
+          const callerUser = await getUser(socket.id);
+          try {
+            await insertCallRecord({
+              callId,
+              callerName: callerUser?.username || null,
+              callerRole: callerUser?.role || null,
+              calleeName: activeTargetUser.username,
+              calleeRole: activeTargetUser.role,
+            });
+            await updateCallRecord(callId, { status: 'missed', ended_at: true });
+          } catch (err) { }
+          return cb({ error: `${activeTargetUser.username} is on another call`, busy: true });
         }
-
-        return cb({ error: `${targetUser.username} is on another call`, busy: true });
       }
 
       const callerUser = await getUser(socket.id);
@@ -662,16 +744,18 @@ async function main() {
       };
 
       if (callerUser.role === 'customer') {
-        callData.agentSocketId = targetId;
+        callData.agentSocketId = targetId || 'offline_target';
         callData.customerSocketId = socket.id;
       } else {
         callData.agentSocketId = socket.id;
-        callData.customerSocketId = targetId;
+        callData.customerSocketId = targetId || 'offline_target';
       }
 
       await setCall(callId, callData);
       await updateUser(socket.id, { callId });
-      await updateUser(targetId, { callId });
+      if (targetId) {
+        await updateUser(targetId, { callId });
+      }
 
       // Metrics
       m.callsInitiatedCounter.inc({ type: 'dialOut' });
@@ -680,24 +764,91 @@ async function main() {
       console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetId} | callId=${callId}`);
 
       // ── Persist call history ──────────────────────────────────────────
-      // targetUser already fetched above in the busy-check
+      // Look up target DB user robustly
+      let finalTargetUser = null;
+      if (targetDbId) {
+        const { getPool } = require('./db');
+        const [rows] = await getPool().query('SELECT id, username, role, push_subscription FROM users WHERE id = ?', [targetDbId]);
+        if (rows.length > 0) finalTargetUser = rows[0];
+      }
+
       try {
         await insertCallRecord({
           callId,
           callerName: callerUser.username,
           callerRole: callerUser.role,
-          calleeName: targetUser?.username || null,
-          calleeRole: targetUser?.role || null,
+          calleeName: targetUsername || finalTargetUser?.username || null,
+          calleeRole: targetRole || finalTargetUser?.role || null,
         });
       } catch (err) {
         console.error(`[dialOut] ❌ Failed to insert call history:`, err);
       }
 
-      targetSocket.emit('incomingCall', {
-        callId,
-        from: callerUser.username,
-        role: callerUser.role
-      });
+      // ── Dispatch Incoming Call (Socket or Web Push) ────────────────────
+      if (targetSocket) {
+        // Target is online via WebSocket
+        targetSocket.emit('incomingCall', {
+          callId,
+          from: callerUser.username,
+          role: callerUser.role
+        });
+      } else if (finalTargetUser && finalTargetUser.push_subscription) {
+        // Target is offline but has a Push Subscription
+        console.log(`[dialOut] 📡 Dispatching Web Push Notification to offline user ${finalTargetUser.username}`);
+
+        const sub = finalTargetUser.push_subscription;
+        const payload = JSON.stringify({
+          type: 'incomingCall',
+          callId,
+          from: callerUser.username,
+          role: callerUser.role,
+          message: `Incoming call from ${callerUser.username}`
+        });
+
+        const sendPush = async () => {
+          try {
+            await webpush.sendNotification(sub, payload);
+            return true;
+          } catch (e) {
+            console.error(`[dialOut] ❌ Failed to send Web Push`, e);
+            if (e.statusCode === 410 || e.statusCode === 404 || String(e).includes('expired') || String(e).includes('unsubscribed')) {
+              console.log(`[dialOut] 🧹 Invalid push subscription for user ${targetDbId}. Deleting from DB.`);
+              const { getPool } = require('./db');
+              getPool().execute('UPDATE users SET push_subscription = NULL WHERE id = ?', [targetDbId]).catch(() => { });
+            }
+            return false;
+          }
+        };
+
+        const success = await sendPush();
+        if (!success) {
+          // Clean up the dangling call record since they are unreachable
+          delete callRouters[callId];
+          await deleteCall(callId);
+          await updateUser(socket.id, { callId: '' });
+          await updateCallRecord(callId, { status: 'missed', ended_at: true });
+          return cb({ error: `User is unreachable (Push notification denied or expired).`, pushFailed: true });
+        }
+
+        // Successfully sent initial push, start re-notifying to simulate ringing
+        globalOfflineTargets[targetDbId] = {
+          callId,
+          callerUsername: callerUser.username,
+          callerRole: callerUser.role,
+          targetRole: finalTargetUser.role
+        };
+
+        pendingRings[callId] = {
+          sub,
+          targetDbId,
+          interval: setInterval(sendPush, 1000)
+        };
+      } else {
+        // Target is totally offline and no push sub
+        console.log(`[dialOut] 📵 Target completely unreachable (no socket, no push)`);
+        await updateCallRecord(callId, { status: 'missed', ended_at: true });
+        return cb({ error: 'Target user is completely offline and unreachable.' });
+      }
 
       cb({ callId });
 
@@ -771,6 +922,9 @@ async function main() {
       // Mark as accepted in Redis so admin sees 'Connected'
       await updateCall(callId, { accepted: 'true' });
       io.to('admins').emit('callsUpdated');
+
+      // Clear any pending push ring loops natively
+      clearPendingRings(callId);
 
       // ── Update call history: mark accepted ──────────────────────────────
       try {
@@ -849,6 +1003,7 @@ async function main() {
         await updateUser(socket.id, { callId: '' });
 
         // Clean up call + router
+        clearPendingRings(callId);
         delete callRouters[callId];
         await deleteCall(callId);
 
@@ -1044,6 +1199,52 @@ async function main() {
     const decoded = verifyToken(token);
     if (!decoded) return res.status(401).json({ valid: false });
     res.json({ valid: true, user: { userId: decoded.userId, username: decoded.username, role: decoded.role } });
+  });
+
+  // JWT auth middleware for REST routes
+  function authMiddleware(req, res, next) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Authorization header required.' });
+    }
+    const decoded = verifyToken(authHeader.slice(7));
+    if (!decoded) return res.status(401).json({ error: 'Invalid or expired token.' });
+    req.user = decoded;
+    next();
+  }
+
+  // ── Web Push Subscriptions ────────────────────────────────────────────────
+  app.get('/api/vapid-public-key', (req, res) => {
+    res.json({ publicKey: 'BIS3SfRv_zL4c4e6LEQqD7r4x3gBbHxnGX_TUXQ0DfXXOLsov4LmKGaMiNPTXvCR1Xlkcc4wTQFe_67XcOXrgkM' });
+  });
+
+  app.post('/api/push-subscribe', authMiddleware, async (req, res) => {
+    try {
+      const subscription = req.body;
+      const { getPool } = require('./db');
+      const pool = getPool();
+      await pool.execute('UPDATE users SET push_subscription = ? WHERE id = ?', [JSON.stringify(subscription), req.user.userId]);
+      console.log(`[push] ✅ Saved push subscription for userId=${req.user.userId}`);
+      res.status(201).json({ success: true });
+    } catch (e) {
+      console.error('[push] ❌ Failed to save subscription', e);
+      res.status(500).json({ error: 'Failed to save subscription' });
+    }
+  });
+
+  // ── Fetch Customers (for Agent dialer) ──────────────────────────────────
+  app.get('/api/customers', authMiddleware, async (req, res) => {
+    try {
+      if (req.user.role !== 'agent' && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const { getPool } = require('./db');
+      // Return ALL customers (even offline ones) so push notifications can reach them
+      const [rows] = await getPool().query('SELECT id, username, phone FROM users WHERE role = "customer"');
+      res.json(rows);
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to fetch customers' });
+    }
   });
 
   // ── Call History REST Endpoints ──────────────────────────────────────────

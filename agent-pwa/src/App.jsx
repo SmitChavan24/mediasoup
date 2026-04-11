@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupCall, getCurrentCallId, clearCurrentCallId, getPreviousSocketId } from './lib/mediasoupClient';
+import { ringtone } from './lib/ringtone';
 
 const SERVER_URL = '';
 const STORAGE_KEY = 'voip_agent_session';
@@ -75,6 +76,7 @@ function App() {
   const [reconnecting, setReconnecting] = useState(false);
   const [peerDisconnected, setPeerDisconnected] = useState(null);
   const [activeCustomers, setActiveCustomers] = useState([]);
+  const [allCustomers, setAllCustomers] = useState([]);
 
   // Call history state
   const [showHistory, setShowHistory] = useState(false);
@@ -90,6 +92,16 @@ function App() {
   const callRef = useRef(null);
   const previousSocketId = useRef(null);
   const socketRef = useRef(null);
+
+  // Incoming call ringtone
+  useEffect(() => {
+    if (incomingCall) {
+      ringtone.start();
+    } else {
+      ringtone.stop();
+    }
+    return () => ringtone.stop();
+  }, [incomingCall]);
 
   // Live call timer
   useEffect(() => {
@@ -147,6 +159,25 @@ function App() {
   useEffect(() => {
     if (showHistory && session) fetchHistory();
   }, [showHistory, historyPage]);
+
+  // Fetch all registered customers for push dialing
+  useEffect(() => {
+    if (!showHistory && session) fetchAllCustomers();
+  }, [showHistory, session]);
+
+  const fetchAllCustomers = async () => {
+    if (!session) return;
+    try {
+      const res = await fetch(`${SERVER_URL}/api/customers`, {
+        headers: { Authorization: `Bearer ${session.token}` },
+      });
+      if (res.ok) {
+        setAllCustomers(await res.json());
+      }
+    } catch (err) {
+      console.error('[agent] Failed to fetch all customers:', err);
+    }
+  };
 
   // Handle page visibility to prevent mobile heartbeat timeouts
   useEffect(() => {
@@ -415,8 +446,18 @@ function App() {
     setIncomingCall(null);
   };
 
-  const dialCustomer = (customerId, customerName) => {
-    socket.emit('dialOut', { targetId: customerId }, (res) => {
+  const dialCustomer = (customerDbId, customerName, isOnline) => {
+    // If the customer is online, find their transient socket ID for traditional dialing.
+    // If they are offline, we dial using targetUserId (DB ID) to trigger Push.
+    let pushDbId = customerDbId;
+    let fallbackTargetId = null;
+    
+    if (isOnline) {
+      const activeObj = activeCustomers.find(c => c.username === customerName);
+      if (activeObj) fallbackTargetId = activeObj.id;
+    }
+
+    socket.emit('dialOut', { targetId: fallbackTargetId, targetUserId: pushDbId }, (res) => {
       if (res.error) {
         if (res.busy) {
           // Show call screen with busy state, then return to main after 3s
@@ -428,7 +469,7 @@ function App() {
       }
 
       const { callId } = res;
-      setActiveCall({ callId, withUser: customerName, state: 'Calling...' });
+      setActiveCall({ callId, withUser: customerName, state: isOnline ? 'Calling...' : 'Sending Push Notification...' });
 
       socket.once('callAccepted', async () => {
         setActiveCall({ callId, withUser: customerName, state: 'Connected' });
@@ -590,24 +631,32 @@ function App() {
             {/* ── Customers Tab ─────────────────────────────────────── */}
             {!showHistory ? (
               <>
-                {activeCustomers.length === 0 ? (
+                {allCustomers.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-icon">👥</div>
-                    <p>No customers currently online.</p>
+                    <p>No customers registered yet.</p>
                   </div>
                 ) : (
                   <ul className="user-list">
-                    {activeCustomers.map(customer => (
-                      <li key={customer.id} className="user-card">
-                        <div className="user-info">
-                          <span className="user-name">{customer.username}</span>
-                          <span className="user-role-tag">Customer</span>
-                        </div>
-                        <button className="call-btn" onClick={() => dialCustomer(customer.id, customer.username)}>
-                          📞 Call
-                        </button>
-                      </li>
-                    ))}
+                    {allCustomers.map(customer => {
+                      const isOnline = activeCustomers.some(ac => ac.username === customer.username);
+                      return (
+                        <li key={customer.id} className="user-card">
+                          <div className="user-info">
+                            <span className="user-name">{customer.username}</span>
+                            <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
+                            <span className="user-role-tag" style={{ marginLeft: 6 }}>{isOnline ? 'Online' : 'Offline'}</span>
+                          </div>
+                          <button 
+                            className={`call-btn ${!isOnline ? 'offline-call' : ''}`} 
+                            onClick={() => dialCustomer(customer.id, customer.username, isOnline)}
+                            style={{ background: isOnline ? '' : 'var(--border)' }}
+                          >
+                            {isOnline ? '📞 Call' : '📡 Push Dial'}
+                          </button>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </>
