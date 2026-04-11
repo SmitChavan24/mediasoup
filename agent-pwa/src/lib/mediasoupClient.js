@@ -36,14 +36,69 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   _currentCallId = callId;
   persistCallState(callId, socket.id);
 
-  // Load device with router capabilities
+  let isReady = false;
+  let currentDevice = null;
+  let currentRecvTransport = null;
+  const pendingProducers = [];
+  const audioElements = [];
+
+  const handleNewProducer = async ({ producerId }) => {
+    if (!isReady || !currentDevice || !currentRecvTransport) {
+      console.log(`[mediasoup] Queueing early producer: ${producerId}`);
+      pendingProducers.push(producerId);
+      return;
+    }
+
+    const consumerParams = await new Promise(res =>
+      socket.emit('consume', {
+        producerId,
+        rtpCapabilities: currentDevice.rtpCapabilities,
+        callId,
+      }, res)
+    );
+    if (consumerParams.error) return console.error('Consume error:', consumerParams.error);
+
+    const consumer = await currentRecvTransport.consume(consumerParams);
+    const audio = new Audio();
+    audio.srcObject = new MediaStream([consumer.track]);
+    audio.autoplay = true;
+    audio.volume = 1.0;
+    audio.style.display = 'none';
+    document.body.appendChild(audio);
+    audioElements.push(audio);
+
+    try {
+      await audio.play();
+      console.log('[mediasoup] ✅ Remote audio playing');
+    } catch (e) {
+      console.warn('[mediasoup] ⚠️ Audio play blocked, retrying on user gesture:', e);
+      const resumeAudio = () => {
+        audio.play().then(() => {
+          console.log('[mediasoup] ✅ Audio resumed after user gesture');
+        }).catch(() => { });
+        document.removeEventListener('click', resumeAudio);
+        document.removeEventListener('touchstart', resumeAudio);
+      };
+      document.addEventListener('click', resumeAudio);
+      document.addEventListener('touchstart', resumeAudio);
+    }
+
+    if (onRemoteAudio) {
+      onRemoteAudio(audio);
+    }
+  };
+
+  // Register listener immediately to avoid missing events during setup async calls
+  socket.on('newProducer', handleNewProducer);
+
   const rtpCapabilities = await new Promise(res =>
     socket.emit('getRouterRtpCapabilities', res)
   );
 
   const device = new Device();
   await device.load({ routerRtpCapabilities: rtpCapabilities });
-  // Create send + recv transports
+  currentDevice = device;
+
   const sendParams = await new Promise(res => socket.emit('createSendTransport', res));
   const recvParams = await new Promise(res => socket.emit('createRecvTransport', res));
   const sendTransport = device.createSendTransport({
@@ -54,6 +109,8 @@ export async function setupCall(socket, callId, onRemoteAudio) {
     ...recvParams,
     iceServers: recvParams.iceServers,
   });
+  currentRecvTransport = recvTransport;
+
   // Wire up DTLS connect events (with guards to prevent duplicate connect)
   let sendConnected = false;
   sendTransport.on('connect', ({ dtlsParameters }, cb, errback) => {
@@ -92,48 +149,11 @@ export async function setupCall(socket, callId, onRemoteAudio) {
       cb({ id });
     });
   });
-  // When the other party's producer is ready, consume it
-  socket.on('newProducer', async ({ producerId }) => {
-    const consumerParams = await new Promise(res =>
-      socket.emit('consume', {
-        producerId,
-        rtpCapabilities: device.rtpCapabilities,
-        callId,
-      }, res)
-    );
-    if (consumerParams.error) {
-      console.error('Consume error:', consumerParams.error);
-      return;
-    }
-    const consumer = await recvTransport.consume(consumerParams);
-    // Play remote audio
-    const audio = new Audio();
-    audio.srcObject = new MediaStream([consumer.track]);
-    audio.autoplay = true;
-    audio.volume = 1.0;
-    // Append to DOM to help some browsers with autoplay
-    audio.style.display = 'none';
-    document.body.appendChild(audio);
-    try {
-      await audio.play();
-      console.log('[mediasoup] ✅ Remote audio playing');
-    } catch (e) {
-      console.warn('[mediasoup] ⚠️ Audio play blocked, retrying on user gesture:', e);
-      const resumeAudio = () => {
-        audio.play().then(() => {
-          console.log('[mediasoup] ✅ Audio resumed after user gesture');
-        }).catch(() => { });
-        document.removeEventListener('click', resumeAudio);
-        document.removeEventListener('touchstart', resumeAudio);
-      };
-      document.addEventListener('click', resumeAudio);
-      document.addEventListener('touchstart', resumeAudio);
-    }
 
-    if (onRemoteAudio) {
-      onRemoteAudio(audio);
-    }
-  });
+  isReady = true;
+  for (const pid of pendingProducers) {
+    handleNewProducer({ producerId: pid });
+  }
 
 
   // Get mic audio and produce
@@ -149,10 +169,11 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   return {
     sendTransport, recvTransport, close: () => {
       _currentCallId = null;
+      audioElements.forEach(a => a.remove());
       stream?.getTracks().forEach(track => track.stop());
       sendTransport.close();
       recvTransport.close();
-      socket.off('newProducer');
+      socket.off('newProducer', handleNewProducer);
     }
   };
 }

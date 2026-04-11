@@ -563,14 +563,14 @@ async function main() {
         try {
           canConsume = router.canConsume({ producerId, rtpCapabilities });
         } catch (routerErr) {
-          console.warn(`[consume] ⚠️ canConsume check failed for producerId=${producerId}: ${routerErr.message}`);
+          console.log(`[consume] ℹ️  Cannot consume producerId=${producerId} (likely ended): ${routerErr.message}`);
           return cb({ error: 'Producer not found or closed' });
         }
         console.log(`[consume] canConsume=${canConsume} routerId=${router.id}`);
 
         if (!canConsume) {
-          console.warn(`[consume] ⚠️ Cannot consume: producerId=${producerId} — RTP capabilities mismatch or producer not found`);
-          return cb({ error: 'Cannot consume' });
+          console.log(`[consume] ℹ️  Cannot consume producerId=${producerId} (likely already closed or true RTP mismatch)`);
+          return cb({ error: 'Producer already closed' });
         }
 
         const recvTransport = localTransports[socket.id]?.recvTransport;

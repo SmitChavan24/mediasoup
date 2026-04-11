@@ -146,6 +146,28 @@ function App() {
     if (showHistory && session) fetchHistory();
   }, [showHistory, historyPage]);
 
+  // Handle page visibility to prevent mobile heartbeat timeouts
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        // Disconnect gracefully if not in a call
+        if (!activeCall && !incomingCall && socketRef.current) {
+          console.log('[customer] App backgrounded - gracefully disconnecting socket');
+          socketRef.current.disconnect();
+        }
+      } else if (document.visibilityState === 'visible') {
+        // Reconnect when returning to foreground
+        if (socketRef.current && socketRef.current.disconnected && session) {
+          console.log('[customer] App foregrounded - reconnecting socket');
+          socketRef.current.connect();
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [activeCall, incomingCall, session]);
+
   const fetchHistory = async () => {
     if (!session) return;
     setHistoryLoading(true);

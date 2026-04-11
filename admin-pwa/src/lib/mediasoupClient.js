@@ -13,6 +13,26 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
   await device.load({ routerRtpCapabilities: rtpCapabilities });
   console.log('[admin-monitor] Device loaded');
 
+  const pendingProducers = [];
+  const audioElements = [];
+  let isReady = false;
+
+  const handleNewProducer = async ({ producerId, role }) => {
+    if (!isReady) {
+      console.log(`[admin-monitor] Queueing early producer: ${producerId}`);
+      pendingProducers.push({ producerId, role });
+      return;
+    }
+    console.log(`[admin-monitor] newProducer event: producerId=${producerId} role=${role}`);
+    if (role === 'agent' && !agentConsumer) {
+      agentConsumer = await consume(producerId, 'agent');
+    } else if (role === 'customer' && !customerConsumer) {
+      customerConsumer = await consume(producerId, 'customer');
+    }
+  };
+
+  socket.on('newProducer', handleNewProducer);
+
   // Admin only needs Recv transport for monitoring, and Send for whispering
   const recvParams = await new Promise(res => socket.emit('createRecvTransport', res));
   console.log('[admin-monitor] createRecvTransport response:', JSON.stringify(recvParams).slice(0, 200));
@@ -72,6 +92,7 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
       audio.setAttribute('playsinline', '');
       audio.setAttribute('autoplay', '');
       audio.srcObject = new MediaStream([consumer.track]);
+      audioElements.push(audio);
       audio.play().catch(e => console.error(`[admin-monitor] audio play error for ${label}:`, e));
       console.log(`[admin-monitor] ✅ Audio element created for ${label}`);
       return consumer;
@@ -98,14 +119,10 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
   }
 
   // Listen for new producers if they weren't ready initially
-  socket.on('newProducer', async ({ producerId, role }) => {
-    console.log(`[admin-monitor] newProducer event: producerId=${producerId} role=${role}`);
-    if (role === 'agent' && !agentConsumer) {
-      agentConsumer = await consume(producerId, 'agent');
-    } else if (role === 'customer' && !customerConsumer) {
-      customerConsumer = await consume(producerId, 'customer');
-    }
-  });
+  isReady = true;
+  for (const p of pendingProducers) {
+    handleNewProducer(p);
+  }
 
   let sendTransport = null;
   let whisperProducer = null;
@@ -150,13 +167,14 @@ export async function setupMonitor(socket, callId, { agentProducerId, customerPr
 
     close: () => {
       console.log('[admin-monitor] Closing monitor...');
+      audioElements.forEach(a => a.remove());
       agentConsumer?.close();
       customerConsumer?.close();
       whisperProducer?.close();
       whisperStream?.getTracks().forEach(t => t.stop());
       recvTransport.close();
       sendTransport?.close();
-      socket.off('newProducer');
+      socket.off('newProducer', handleNewProducer);
     }
   };
 }
