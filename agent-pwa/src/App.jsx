@@ -371,6 +371,10 @@ function App() {
       setIncomingCall({ callId, from, role });
     });
 
+    s.on('callStateUpdate', (newState) => {
+      setActiveCall((prev) => prev ? { ...prev, state: newState } : null);
+    });
+
     s.on('callEnded', () => {
       handleCallCleanup();
     });

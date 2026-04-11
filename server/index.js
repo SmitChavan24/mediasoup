@@ -330,7 +330,7 @@ async function main() {
 
     // ── Check Offline Call Handoff ──────────────────────────────────────────
     // If this user was dialed while offline, immediately alert them!
-    const userDbId = socket.user.id;
+    const userDbId = socket.user.userId;
     if (userDbId && globalOfflineTargets[userDbId]) {
       const offlinePending = globalOfflineTargets[userDbId];
 
@@ -688,8 +688,8 @@ async function main() {
 
       let targetSocket = null;
       let targetDbId = targetUserId;
-      let targetUsername = 'Unknown';
-      let targetRole = 'customer';
+      let targetUsername = null;
+      let targetRole = null;
 
       // Find by given socket.id (legacy)
       if (targetId) {
