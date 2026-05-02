@@ -67,7 +67,7 @@ function getAnyRouter() {
 // ── ICE servers (TURN fallback for clients behind symmetric NAT / firewalls) ──
 const iceServers = [
   {
-    urls: 'turn:35.154.164.61:3478',
+    urls: 'turn:43.205.117.210:3478',
     username: 'turnuser',
     credential: 'smit1234',
   },
