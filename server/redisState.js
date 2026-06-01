@@ -71,11 +71,13 @@ async function cleanupStaleState() {
 
 // ── User Operations ──────────────────────────────────────────────────────────
 
-async function setUser(socketId, { username, role, status = 'connected' }) {
+async function setUser(socketId, { username, role, status = 'connected', userId = '', phone = '' }) {
   await redis.hmset(`user:${socketId}`, {
     username,
     role,
     status,
+    userId,
+    phone,
     callId: '',
     disconnectedAt: '',
   });
@@ -227,6 +229,49 @@ async function deleteGracePeriod(socketId) {
   await redis.del(`grace:${socketId}`);
 }
 
+// ── Callback Requests ────────────────────────────────────────────────────────
+
+async function setCallbackRequest(userId, { username, role, phone, timestamp }) {
+  await redis.sadd('callbacks:pending', userId);
+  await redis.hmset(`callback:${userId}`, {
+    username: username || '',
+    role: role || '',
+    phone: phone || '',
+    timestamp: timestamp || Date.now()
+  });
+}
+
+async function deleteCallbackRequest(userId) {
+  await redis.srem('callbacks:pending', userId);
+  await redis.del(`callback:${userId}`);
+}
+
+async function getCallbackRequests() {
+  const ids = await redis.smembers('callbacks:pending');
+  if (ids.length === 0) return [];
+
+  const pipeline = redis.pipeline();
+  for (const id of ids) {
+    pipeline.hgetall(`callback:${id}`);
+  }
+  const results = await pipeline.exec();
+
+  const requests = [];
+  for (let i = 0; i < results.length; i++) {
+    const [err, data] = results[i];
+    if (!err && data && data.timestamp) {
+      requests.push({
+        userId: ids[i],
+        username: data.username,
+        role: data.role,
+        phone: data.phone,
+        timestamp: parseInt(data.timestamp, 10),
+      });
+    }
+  }
+  return requests.sort((a, b) => b.timestamp - a.timestamp);
+}
+
 // ── Keyspace Notifications (expired keys) ────────────────────────────────────
 
 /**
@@ -276,6 +321,11 @@ module.exports = {
   setGracePeriod,
   getGracePeriod,
   deleteGracePeriod,
+
+  // Callback Requests
+  setCallbackRequest,
+  deleteCallbackRequest,
+  getCallbackRequests,
 
   // Subscriptions
   subscribeToExpirations,

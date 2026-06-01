@@ -136,4 +136,80 @@ function generateToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
-module.exports = { registerUser, loginUser, verifyToken };
+/**
+ * Guest Login for PHP Widget Integration.
+ * Always uses a synthetic phone derived from phpUserId as the primary key.
+ * This completely isolates widget customer accounts from agent/admin accounts.
+ */
+async function guestLogin(username, phone, phpUserId) {
+  const pool = getPool();
+
+  // Always use phpUserId-derived key when available — this prevents any clash
+  // with existing agent/admin accounts that may share the same real phone.
+  let lookupPhone;
+  if (phpUserId) {
+    // Stable, unique identifier: "php" + zero-padded userId, 12 chars total
+    lookupPhone = `php${String(phpUserId).replace(/\D/g, '').padStart(9, '0')}`.slice(0, 12);
+  } else if (phone && phone.trim().length >= 10) {
+    try { lookupPhone = validatePhone(phone); } catch (e) { /* fall through */ }
+  }
+
+  if (!lookupPhone) {
+    throw new Error('A valid phone number or user ID is required.');
+  }
+
+  const [rows] = await pool.execute(
+    'SELECT id, username, phone, role FROM users WHERE phone = ?',
+    [lookupPhone]
+  );
+
+  let user;
+  if (rows.length === 0) {
+    // Create a new customer account
+    const salt = await bcrypt.genSalt(10);
+    const randomPassword = require('crypto').randomBytes(16).toString('hex');
+    const passwordHash = await bcrypt.hash(randomPassword, salt);
+
+    // Attempt insert; if username is taken, append phpUserId suffix
+    let insertName = username.trim() || 'Customer';
+    try {
+      const [result] = await pool.execute(
+        'INSERT INTO users (username, phone, password_hash, role) VALUES (?, ?, ?, ?)',
+        [insertName, lookupPhone, passwordHash, 'customer']
+      );
+      user = { id: result.insertId, username: insertName, phone: lookupPhone, role: 'customer' };
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        insertName = `${insertName}_${String(phpUserId || Date.now()).slice(-4)}`;
+        const [result] = await pool.execute(
+          'INSERT INTO users (username, phone, password_hash, role) VALUES (?, ?, ?, ?)',
+          [insertName, lookupPhone, passwordHash, 'customer']
+        );
+        user = { id: result.insertId, username: insertName, phone: lookupPhone, role: 'customer' };
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    user = rows[0];
+    // Update username if it has changed in the PHP app
+    if (username.trim() && user.username !== username.trim()) {
+      await pool.execute('UPDATE users SET username = ?, last_login = NOW() WHERE id = ?', [username.trim(), user.id]);
+      user.username = username.trim();
+    } else {
+      await pool.execute('UPDATE users SET last_login = NOW() WHERE id = ?', [user.id]);
+    }
+  }
+
+  const token = generateToken({ userId: user.id, username: user.username, role: user.role });
+
+  return {
+    id: user.id,
+    username: user.username,
+    phone: user.phone,
+    role: user.role,
+    token,
+  };
+}
+
+module.exports = { registerUser, loginUser, verifyToken, guestLogin };

@@ -79,7 +79,8 @@ function App() {
   const [allCustomers, setAllCustomers] = useState([]);
 
   // Call history state
-  const [showHistory, setShowHistory] = useState(false);
+  const [navTab, setNavTab] = useState('customers'); // 'customers' | 'callbacks' | 'history'
+  const [callbackRequests, setCallbackRequests] = useState([]);
   const [callHistory, setCallHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyPage, setHistoryPage] = useState(1);
@@ -157,13 +158,13 @@ function App() {
 
   // Fetch call history when toggled
   useEffect(() => {
-    if (showHistory && session) fetchHistory();
-  }, [showHistory, historyPage]);
+    if (navTab === 'history' && session) fetchHistory();
+  }, [navTab, historyPage]);
 
   // Fetch all registered customers for push dialing
   useEffect(() => {
-    if (!showHistory && session) fetchAllCustomers();
-  }, [showHistory, session]);
+    if (navTab === 'customers' && session) fetchAllCustomers();
+  }, [navTab, session]);
 
   const fetchAllCustomers = async () => {
     if (!session) return;
@@ -346,6 +347,9 @@ function App() {
       previousSocketId.current = s.id;
       setConnected(true);
       s.emit('getPresence');
+      s.emit('getCallbackRequests', (requests) => {
+        if (Array.isArray(requests)) setCallbackRequests(requests);
+      });
     });
 
     s.on('connect_error', (err) => {
@@ -369,6 +373,10 @@ function App() {
 
     s.on('incomingCall', ({ callId, from, role }) => {
       setIncomingCall({ callId, from, role });
+    });
+
+    s.on('callbackRequestsUpdate', (requests) => {
+      setCallbackRequests(requests);
     });
 
     s.on('callStateUpdate', (newState) => {
@@ -609,11 +617,14 @@ function App() {
         <>
           {/* ── Nav Tabs ──────────────────────────────────────────────── */}
           <nav className="nav-tabs">
-            <button className={`nav-tab ${!showHistory ? 'active' : ''}`} onClick={() => setShowHistory(false)}>
+            <button className={`nav-tab ${navTab === 'customers' ? 'active' : ''}`} onClick={() => setNavTab('customers')}>
               👥 Customers ({activeCustomers.length})
             </button>
-            <button className={`nav-tab ${showHistory ? 'active' : ''}`} onClick={() => setShowHistory(true)}>
-              📋 Call History
+            <button className={`nav-tab ${navTab === 'callbacks' ? 'active' : ''}`} onClick={() => setNavTab('callbacks')}>
+              🛎️ Callbacks ({callbackRequests.length})
+            </button>
+            <button className={`nav-tab ${navTab === 'history' ? 'active' : ''}`} onClick={() => setNavTab('history')}>
+              📋 History
             </button>
           </nav>
 
@@ -633,7 +644,7 @@ function App() {
             )}
 
             {/* ── Customers Tab ─────────────────────────────────────── */}
-            {!showHistory ? (
+            {navTab === 'customers' && (
               <>
                 {allCustomers.length === 0 ? (
                   <div className="empty-state">
@@ -664,7 +675,47 @@ function App() {
                   </ul>
                 )}
               </>
-            ) : (
+            )}
+
+            {/* ── Callbacks Tab ─────────────────────────────────────── */}
+            {navTab === 'callbacks' && (
+              <>
+                <div className="section-title">Pending Callbacks</div>
+                {callbackRequests.length === 0 ? (
+                  <div className="empty-state">
+                    <div className="empty-icon">🛎️</div>
+                    <p>No pending callback requests.</p>
+                  </div>
+                ) : (
+                  <ul className="user-list">
+                    {callbackRequests.map(req => {
+                      const isOnline = activeCustomers.some(ac => ac.username === req.username);
+                      return (
+                        <li key={req.userId} className="user-card">
+                          <div className="user-info">
+                            <span className="user-name">{req.username}</span>
+                            <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
+                            <span className="user-role-tag" style={{ marginLeft: 6 }}>{isOnline ? 'Online' : 'Offline'}</span>
+                            <div style={{ fontSize: '11px', color: '#666', marginTop: 4 }}>
+                              Requested: {fmtDateTime(req.timestamp)}
+                            </div>
+                          </div>
+                          <button 
+                            className={`call-btn ${!isOnline ? 'offline-call' : ''}`} 
+                            onClick={() => dialCustomer(req.userId, req.username, isOnline)}
+                            style={{ background: isOnline ? '' : 'var(--border)' }}
+                          >
+                            {isOnline ? '📞 Call' : '📡 Push Dial'}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </>
+            )}
+
+            {navTab === 'history' && (
               /* ── History Tab ───────────────────────────────────────── */
               <>
                 <div className="section-title">My Call History</div>

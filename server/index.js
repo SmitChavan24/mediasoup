@@ -31,15 +31,22 @@ const {
   deleteGracePeriod,
 
   subscribeToExpirations,
+  setCallbackRequest,
+  deleteCallbackRequest,
+  getCallbackRequests,
 } = require('./redisState');
 const { attachHeartbeat } = require('./heartbeat');
-const { registerUser, loginUser, verifyToken } = require('./auth');
+const { registerUser, loginUser, verifyToken, guestLogin } = require('./auth');
 const { createPool, initDatabase } = require('./db');
 const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername } = require('./callHistory');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Serve the widget files
+const path = require('path');
+app.use('/api/widget', express.static(path.join(__dirname, '../php-widget/dist')));
 
 const webpush = require('web-push');
 
@@ -317,7 +324,12 @@ async function main() {
 
     console.log(`[connect] ✅ ${role} connected: ${username} (${socket.id})`);
 
-    await setUser(socket.id, { username, role, status: 'connected' });
+    await setUser(socket.id, { 
+      username, 
+      role, 
+      status: 'connected',
+      userId: socket.user.userId 
+    });
     await addToPresence(role, socket.id);
 
     if (role === 'agent') {
@@ -677,6 +689,55 @@ async function main() {
       } catch (err) {
         console.error(`[consume] ❌ Consume FAILED for socket=${socket.id}:`, err);
         cb({ error: err.message });
+      }
+    });
+
+    // ── Callback Requests ────────────────────────────────────────────────────
+    
+    socket.on('requestCallback', async (cb) => {
+      try {
+        const user = await getUser(socket.id);
+        if (!user || user.role !== 'customer') {
+          return cb && cb({ error: 'Only customers can request a callback' });
+        }
+        
+        await setCallbackRequest(user.userId || socket.id, {
+          username: user.username,
+          role: user.role,
+          phone: user.phone || '',
+          timestamp: Date.now()
+        });
+        
+        // Broadcast to agents
+        const requests = await getCallbackRequests();
+        io.to('agents').emit('callbackRequestsUpdate', requests);
+        if (cb) cb({ success: true });
+      } catch (err) {
+        if (cb) cb({ error: err.message });
+      }
+    });
+
+    socket.on('cancelCallback', async (cb) => {
+      try {
+        const user = await getUser(socket.id);
+        if (!user) return cb && cb({ error: 'Not logged in' });
+        
+        await deleteCallbackRequest(user.userId || socket.id);
+        
+        const requests = await getCallbackRequests();
+        io.to('agents').emit('callbackRequestsUpdate', requests);
+        if (cb) cb({ success: true });
+      } catch (err) {
+        if (cb) cb({ error: err.message });
+      }
+    });
+
+    socket.on('getCallbackRequests', async (cb) => {
+      try {
+        const requests = await getCallbackRequests();
+        if (cb) cb(requests);
+      } catch (err) {
+        if (cb) cb({ error: err.message });
       }
     });
 
@@ -1189,6 +1250,22 @@ async function main() {
     } catch (err) {
       console.error(`[auth] ❌ Login failed:`, err.message);
       res.status(401).json({ error: err.message });
+    }
+  });
+
+  // Guest login for PHP widget — auto-registers customer by phone
+  app.post('/api/guest-login', async (req, res) => {
+    try {
+      const { username, phone, phpUserId } = req.body;
+      if (!username || (!phone && !phpUserId)) {
+        return res.status(400).json({ error: 'Username and phone (or userId) are required.' });
+      }
+      const result = await guestLogin(username, phone, phpUserId);
+      console.log(`[auth] ✅ Guest login: ${result.username} phone=${result.phone}`);
+      res.json(result);
+    } catch (err) {
+      console.error(`[auth] ❌ Guest login failed:`, err.message);
+      res.status(400).json({ error: err.message });
     }
   });
 
