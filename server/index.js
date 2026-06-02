@@ -35,7 +35,11 @@ const {
 const { attachHeartbeat } = require('./heartbeat');
 const { registerUser, loginUser, verifyToken } = require('./auth');
 const { createPool, initDatabase } = require('./db');
+const mysql2 = require('mysql2/promise');
 const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername } = require('./callHistory');
+
+let tgPool;       // AWS Remote DB (Names & Info)
+let localTgPool;  // Local DB (Push Subscriptions & PWA Operations)
 
 const app = express();
 app.use(cors());
@@ -55,9 +59,32 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 // ── Socket.IO Authentication Middleware ───────────────────────────────────────
 // Every socket connection MUST provide a valid JWT token.
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token;
   if (!token) {
+    if (socket.handshake.auth?.isPwaClient) {
+      const { userId, username } = socket.handshake.auth;
+      let finalUsername = username || 'Customer';
+
+      if (userId && !userId.startsWith('guest_') && tgPool) {
+        try {
+          // Get real name and phone from remote AWS DB (dbt_user)
+          const [tgRows] = await tgPool.query('SELECT COALESCE(CONCAT(first_name, " ", last_name), username, phone) as name FROM dbt_user WHERE user_id = ? LIMIT 1', [userId]);
+          if (tgRows && tgRows.length > 0 && tgRows[0].name) {
+            finalUsername = tgRows[0].name; // Use real name or fallback to phone
+          }
+        } catch (err) {
+          console.error('[auth] Failed to lookup PWA user in AWS DB:', err.message);
+        }
+      }
+
+      socket.user = {
+        userId: userId || `guest_${Date.now()}`,
+        username: finalUsername,
+        role: 'customer'
+      };
+      return next();
+    }
     return next(new Error('Authentication required. Please login first.'));
   }
   const decoded = verifyToken(token);
@@ -84,13 +111,17 @@ const localConsumers = {};   // socketId → consumer
 const callRouters = {};       // callId → router
 const pendingRings = {};      // callId → { interval, sub, targetDbId }
 const globalOfflineTargets = {}; // targetDbId → { callId, callerUsername, callerRole, targetRole }
+const PUSH_DIAL_TIMEOUT_MS = parseInt(process.env.PUSH_DIAL_TIMEOUT_MS, 10) || 60000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function clearPendingRings(callId) {
   if (callId && pendingRings[callId]) {
-    clearInterval(pendingRings[callId].interval);
-    webpush.sendNotification(pendingRings[callId].sub, JSON.stringify({ type: 'cancelCall' })).catch(() => { });
+    if (pendingRings[callId].interval) clearInterval(pendingRings[callId].interval);
+    if (pendingRings[callId].timeout) clearTimeout(pendingRings[callId].timeout);
+    if (pendingRings[callId].sub) {
+      webpush.sendNotification(pendingRings[callId].sub, JSON.stringify({ type: 'cancelCall' })).catch(() => { });
+    }
     if (pendingRings[callId].targetDbId) {
       delete globalOfflineTargets[pendingRings[callId].targetDbId];
     }
@@ -266,7 +297,6 @@ async function endCall(socket) {
 
   // Clear push loop
   clearPendingRings(callId);
-  await updateUser(socket.id, { callId: '' });
 
   // Notify any admins monitoring this call
   io.to(`monitor:${callId}`).emit('callEnded');
@@ -295,6 +325,30 @@ async function main() {
   createPool();
   await initDatabase();
 
+  // 0b. Initialize TG Level PWA database pool (Remote)
+  tgPool = mysql2.createPool({
+    host: process.env.TG_DB_HOST,
+    user: process.env.TG_DB_USER,
+    password: process.env.TG_DB_PASSWORD,
+    database: process.env.TG_DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0,
+  });
+  console.log('[db] ✅ TG Level PWA database pool (Remote) created');
+
+  // 0c. Initialize TG Level PWA database pool (Local)
+  localTgPool = mysql2.createPool({
+    host: process.env.LOCAL_TG_DB_HOST,
+    user: process.env.LOCAL_TG_DB_USER,
+    password: process.env.LOCAL_TG_DB_PASSWORD,
+    database: process.env.LOCAL_TG_DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0,
+  });
+  console.log('[db] ✅ TG Level PWA database pool (Local) created');
+
   // 1. Connect to Redis and clean stale state
   createRedisClients();
   await cleanupStaleState();
@@ -308,6 +362,37 @@ async function main() {
     console.log(`[grace] ⏰ Grace period expired for ${socketId} — running full cleanup`);
     await fullCleanup(socketId);
   });
+
+  // 3b. Stale call garbage collector — sweep every 5 min
+  setInterval(async () => {
+    try {
+      const { getRedis } = require('./redisState');
+      const r = getRedis();
+      const callKeys = await r.keys('call:*');
+      if (callKeys.length === 0) return;
+
+      for (const key of callKeys) {
+        const callId = key.replace('call:', '');
+        const call = await getCall(callId);
+        if (!call) continue;
+
+        const age = Date.now() - parseInt(call.startTime || '0', 10);
+        const agentExists = call.agentSocketId && io.sockets.sockets.has(call.agentSocketId);
+        const customerExists = call.customerSocketId && io.sockets.sockets.has(call.customerSocketId);
+
+        // If call is older than 2 min and neither party is connected, clean it up
+        if (age > 120000 && !agentExists && !customerExists) {
+          console.log(`[gc] 🧹 Cleaning stale call: ${callId} (age=${Math.round(age/1000)}s)`);
+          clearPendingRings(callId);
+          delete callRouters[callId];
+          await deleteCall(callId);
+          m.activeCallsGauge.dec();
+        }
+      }
+    } catch (err) {
+      console.error('[gc] ❌ Stale call sweep error:', err.message);
+    }
+  }, 5 * 60 * 1000);
 
   // 4. Socket.IO connection handler
   io.on('connection', async (socket) => {
@@ -401,9 +486,9 @@ async function main() {
         await removeFromPresence(user.role, previousSocketId);
         closeLocalMediasoup(previousSocketId);
 
-        await setUser(socket.id, { username: user.username, role: user.role, status: 'connected' });
+        // Connection handler already called setUser + addToPresence for the new socket.
+        // Just migrate the callId to the already-registered new socket.
         await updateUser(socket.id, { callId });
-        await addToPresence(user.role, socket.id);
 
         // Update call record with new socket ID
         if (call.agentSocketId === previousSocketId) {
@@ -429,6 +514,7 @@ async function main() {
           const otherSocket = io.sockets.sockets.get(otherSocketId);
           if (otherSocket) {
             otherSocket.emit('participantReconnected', { userId: socket.id });
+            otherSocket.emit('callStateUpdate', 'Connected');
           }
         }
 
@@ -761,7 +847,7 @@ async function main() {
       m.callsInitiatedCounter.inc({ type: 'dialOut' });
       m.activeCallsGauge.inc();
 
-      console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetId} | callId=${callId}`);
+      console.log(`[dialOut] 📞 ${callerUser.username} (${callerUser.role}) → ${targetUsername || targetDbId || 'offline'} | callId=${callId}`);
 
       // ── Persist call history ──────────────────────────────────────────
       // Look up target DB user robustly
@@ -827,6 +913,7 @@ async function main() {
           await deleteCall(callId);
           await updateUser(socket.id, { callId: '' });
           await updateCallRecord(callId, { status: 'missed', ended_at: true });
+          m.activeCallsGauge.dec();
           return cb({ error: `User is unreachable (Push notification denied or expired).`, pushFailed: true });
         }
 
@@ -841,12 +928,119 @@ async function main() {
         pendingRings[callId] = {
           sub,
           targetDbId,
-          interval: setInterval(sendPush, 1000)
+          interval: setInterval(sendPush, 1000),
+          timeout: setTimeout(async () => {
+            console.log(`[dialOut] ⏰ Push dial timeout (${PUSH_DIAL_TIMEOUT_MS/1000}s) for callId=${callId}`);
+            clearPendingRings(callId);
+            delete callRouters[callId];
+            await deleteCall(callId);
+            await updateUser(socket.id, { callId: '' });
+            await updateCallRecord(callId, { status: 'missed', ended_at: true });
+            m.activeCallsGauge.dec();
+            socket.emit('callEnded');
+            io.to('admins').emit('callsUpdated');
+          }, PUSH_DIAL_TIMEOUT_MS)
+        };
+      } else if (targetDbId && localTgPool) {
+        // Target is an offline PWA Customer, try OneSignal
+        console.log(`[dialOut] 📡 Checking Push Subscription for offline PWA user ${targetDbId}`);
+
+        const sendOneSignalPush = async () => {
+          try {
+            const [pushRows] = await localTgPool.query(
+              `SELECT onesignal_id FROM users WHERE user_id = ? AND onesignal_id IS NOT NULL AND push_status IN ('active', 'Subscribed') LIMIT 1`,
+              [targetDbId]
+            );
+
+            if (pushRows.length > 0) {
+              const oneSignalId = pushRows[0].onesignal_id;
+              console.log(`[dialOut] 📡 Dispatching OneSignal Push to onesignal_id=${oneSignalId}`);
+
+              const payload = {
+                app_id: process.env.ONESIGNAL_APP_ID,
+                include_player_ids: [oneSignalId],
+                headings: { en: `Incoming Call` },
+                contents: { en: `Incoming call from ${callerUser.username}` },
+                data: {
+                  type: 'incomingCall',
+                  callId,
+                  from: callerUser.username,
+                  role: callerUser.role
+                },
+                priority: 10,
+                url: `https://app.tglevels.in/call?callId=${callId}`,
+                ios_sound: "default",
+                android_sound: "default",
+                chrome_web_icon: "https://bullionscan.io/tg-level-icon.png",
+                chrome_web_badge: "https://bullionscan.io/tg-level-icon.png",
+                large_icon: "https://bullionscan.io/tg-level-icon.png",
+                small_icon: "https://bullionscan.io/tg-level-icon.png"
+              };
+
+              const response = await fetch("https://onesignal.com/api/v1/notifications", {
+                method: 'POST',
+                headers: {
+                  "Content-Type": "application/json; charset=utf-8",
+                  "Authorization": `Basic ${process.env.ONESIGNAL_API_KEY}`
+                },
+                body: JSON.stringify(payload)
+              });
+
+              const result = await response.json();
+              if (response.ok && result.recipients > 0) {
+                return true;
+              }
+            }
+            return false;
+          } catch (e) {
+            console.error(`[dialOut] ❌ OneSignal API error:`, e);
+            return false;
+          }
+        };
+
+        const success = await sendOneSignalPush();
+        if (!success) {
+          delete callRouters[callId];
+          await deleteCall(callId);
+          await updateUser(socket.id, { callId: '' });
+          await updateCallRecord(callId, { status: 'missed', ended_at: true });
+          m.activeCallsGauge.dec();
+          return cb({ error: `User is unreachable (Push notification denied or expired).`, pushFailed: true });
+        }
+
+        // Successfully sent push via OneSignal
+        globalOfflineTargets[targetDbId] = {
+          callId,
+          callerUsername: callerUser.username,
+          callerRole: callerUser.role,
+          targetRole: 'customer'
+        };
+
+        // We don't setInterval for OneSignal to avoid rate limits.
+        // Auto-cancel after timeout if unanswered.
+        pendingRings[callId] = {
+          targetDbId,
+          interval: null,
+          timeout: setTimeout(async () => {
+            console.log(`[dialOut] ⏰ Push dial timeout (${PUSH_DIAL_TIMEOUT_MS/1000}s) for callId=${callId}`);
+            clearPendingRings(callId);
+            delete callRouters[callId];
+            await deleteCall(callId);
+            await updateUser(socket.id, { callId: '' });
+            await updateCallRecord(callId, { status: 'missed', ended_at: true });
+            m.activeCallsGauge.dec();
+            socket.emit('callEnded');
+            io.to('admins').emit('callsUpdated');
+          }, PUSH_DIAL_TIMEOUT_MS)
         };
       } else {
         // Target is totally offline and no push sub
         console.log(`[dialOut] 📵 Target completely unreachable (no socket, no push)`);
+        delete callRouters[callId];
+        await deleteCall(callId);
+        await updateUser(socket.id, { callId: '' });
         await updateCallRecord(callId, { status: 'missed', ended_at: true });
+        m.activeCallsGauge.dec();
         return cb({ error: 'Target user is completely offline and unreachable.' });
       }
 
@@ -958,7 +1152,9 @@ async function main() {
         console.warn(`[acceptCall] ⚠️  No other party found for callId=${callId}`);
       }
 
-      cb({ callId });
+      if (typeof cb === 'function') {
+        cb({ callId });
+      }
     });
 
     // ── REJECT CALL ──────────────────────────────────────────────────────
@@ -1232,17 +1428,55 @@ async function main() {
     }
   });
 
-  // ── Fetch Customers (for Agent dialer) ──────────────────────────────────
+  // ── Fetch Customers from TG Level PWA database ─────────────────────────────
   app.get('/api/customers', authMiddleware, async (req, res) => {
     try {
       if (req.user.role !== 'agent' && req.user.role !== 'admin') {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const { getPool } = require('./db');
-      // Return ALL customers (even offline ones) so push notifications can reach them
-      const [rows] = await getPool().query('SELECT id, username, phone FROM users WHERE role = "customer"');
-      res.json(rows);
+      // Query remote AWS DB (dbt_user) for all active customers
+      const [rows] = await tgPool.query(
+        `SELECT user_id AS id, 
+                COALESCE(CONCAT(first_name, ' ', last_name), username, phone) AS username, 
+                phone,
+                first_name,
+                last_name,
+                email,
+                image,
+                0 AS hasPush
+         FROM dbt_user 
+         WHERE status = 1 
+         ORDER BY created DESC`
+      );
+
+      // Now query local PWA DB (tg_level.users) to see who has active push subscriptions
+      if (rows.length > 0 && localTgPool) {
+        try {
+          const userIds = rows.map(r => r.id).filter(Boolean);
+          if (userIds.length > 0) {
+            const [pushRows] = await localTgPool.query(
+              `SELECT user_id FROM users WHERE onesignal_id IS NOT NULL AND push_status IN ('active', 'Subscribed') AND user_id IN (?)`,
+              [userIds]
+            );
+            
+            const activePushUsers = new Set(pushRows.map(r => r.user_id));
+            rows.forEach(r => {
+              if (activePushUsers.has(r.id)) {
+                r.hasPush = 1;
+              }
+            });
+          }
+        } catch (err) {
+          console.error('[api] ⚠️ Failed to fetch push status from local PWA DB:', err.message);
+        }
+      }
+
+      // Filter to ONLY return users who actually have an active push subscription
+      const subscribedUsersOnly = rows.filter(r => r.hasPush === 1);
+
+      res.json(subscribedUsersOnly);
     } catch (e) {
+      console.error('[api] ❌ Failed to fetch TG Level customers:', e.message);
       res.status(500).json({ error: 'Failed to fetch customers' });
     }
   });
@@ -1330,7 +1564,7 @@ async function main() {
 
   // ── Immediate snapshot on startup + periodic console logging ─────────────
   startPeriodicLog();
-  server.listen(3000, () => {
+  server.listen(3005, () => {
     console.log('Server running on port 3000');
     console.log('Prometheus metrics available at http://localhost:3000/metrics');
     console.log('Redis health available at http://localhost:3000/redis-health');

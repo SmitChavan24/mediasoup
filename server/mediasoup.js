@@ -33,8 +33,8 @@ let workerIndex = 0;
 async function spawnWorker(index) {
   const worker = await mediasoup.createWorker({
     logLevel: 'warn',
-    rtcMinPort: 10000,   // ← 50 000 ports shared across all workers
-    rtcMaxPort: 59999,   //   comfortably handles 800+ simultaneous transports
+    rtcMinPort: parseInt(process.env.RTC_MIN_PORT, 10) || 40000,
+    rtcMaxPort: parseInt(process.env.RTC_MAX_PORT, 10) || 49999,
   });
   // Auto-respawn crashed workers so the pool stays healthy
   worker.on('died', async () => {
@@ -65,13 +65,21 @@ function getAnyRouter() {
   return workers[0]?.router;
 }
 // ── ICE servers (TURN fallback for clients behind symmetric NAT / firewalls) ──
-const iceServers = [
-  {
-    urls: 'turn:43.205.117.210:3478',
-    username: 'turnuser',
-    credential: 'smit1234',
-  },
-];
+// TURN is FALLBACK ONLY. Direct mediasoup UDP (host candidates) is the primary
+// path. The clients who need TURN are usually on UDP-blocking networks, so the
+// useful relay transports are TCP and TLS — not UDP.
+const TURN_HOST = process.env.TURN_HOST;                 // public IP / domain of coturn
+const TURN_TLS_HOST = process.env.TURN_TLS_HOST || TURN_HOST; // domain with a valid TLS cert
+const TURN_USERNAME = process.env.TURN_USERNAME;
+const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL;
+
+const iceServers = (TURN_HOST && TURN_USERNAME && TURN_CREDENTIAL)
+  ? [
+      { urls: `turn:${TURN_HOST}:3478?transport=udp`, username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+      { urls: `turn:${TURN_HOST}:3478?transport=tcp`, username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+      { urls: `turns:${TURN_TLS_HOST}:5349?transport=tcp`, username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+    ]
+  : [];
 // ── Transport factory (accepts the per-call router) ───────────────────────────
 async function createTransport(router) {
   const transport = await router.createWebRtcTransport(transportOptions);

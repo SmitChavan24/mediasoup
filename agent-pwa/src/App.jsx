@@ -3,7 +3,7 @@ import { io } from 'socket.io-client';
 import { setupCall, getCurrentCallId, clearCurrentCallId, getPreviousSocketId } from './lib/mediasoupClient';
 import { ringtone } from './lib/ringtone';
 
-const SERVER_URL = '';
+const SERVER_URL = 'http://localhost:3005';
 const STORAGE_KEY = 'voip_agent_session';
 
 function getStoredSession() {
@@ -42,8 +42,8 @@ function fmtDateTime(dt) {
 function StatusBadge({ status }) {
   const colors = {
     completed: { bg: 'rgba(16,185,129,0.15)', color: '#34d399', label: 'Completed' },
-    missed:    { bg: 'rgba(251,191,36,0.15)', color: '#fbbf24', label: 'Missed' },
-    rejected:  { bg: 'rgba(239,68,68,0.15)',  color: '#f87171', label: 'Rejected' },
+    missed: { bg: 'rgba(251,191,36,0.15)', color: '#fbbf24', label: 'Missed' },
+    rejected: { bg: 'rgba(239,68,68,0.15)', color: '#f87171', label: 'Rejected' },
   };
   const c = colors[status] || colors.missed;
   return (
@@ -92,6 +92,7 @@ function App() {
   const callRef = useRef(null);
   const previousSocketId = useRef(null);
   const socketRef = useRef(null);
+  const dialingRef = useRef(false);
 
   // Incoming call ringtone
   useEffect(() => {
@@ -184,16 +185,16 @@ function App() {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         // Disconnect gracefully if not in a call
-        if (!activeCall && !incomingCall && socketRef.current) {
-          console.log('[agent] App backgrounded - gracefully disconnecting socket');
-          socketRef.current.disconnect();
-        }
+        // if (!activeCall && !incomingCall && socketRef.current) {
+        //   console.log('[agent] App backgrounded - gracefully disconnecting socket');
+        //   socketRef.current.disconnect();
+        // }
       } else if (document.visibilityState === 'visible') {
         // Reconnect when returning to foreground
-        if (socketRef.current && socketRef.current.disconnected && session) {
-          console.log('[agent] App foregrounded - reconnecting socket');
-          socketRef.current.connect();
-        }
+        // if (socketRef.current && socketRef.current.disconnected && session) {
+        //   console.log('[agent] App foregrounded - reconnecting socket');
+        //   socketRef.current.connect();
+        // }
       }
     };
 
@@ -451,17 +452,21 @@ function App() {
   };
 
   const dialCustomer = (customerDbId, customerName, isOnline) => {
+    if (dialingRef.current) return; // Prevent double-dial
+    dialingRef.current = true;
+
     // If the customer is online, find their transient socket ID for traditional dialing.
     // If they are offline, we dial using targetUserId (DB ID) to trigger Push.
     let pushDbId = customerDbId;
     let fallbackTargetId = null;
-    
+
     if (isOnline) {
       const activeObj = activeCustomers.find(c => c.username === customerName);
       if (activeObj) fallbackTargetId = activeObj.id;
     }
 
     socket.emit('dialOut', { targetId: fallbackTargetId, targetUserId: pushDbId }, (res) => {
+      dialingRef.current = false;
       if (res.error) {
         if (res.busy) {
           // Show call screen with busy state, then return to main after 3s
@@ -635,34 +640,63 @@ function App() {
             {/* ── Customers Tab ─────────────────────────────────────── */}
             {!showHistory ? (
               <>
-                {allCustomers.length === 0 ? (
-                  <div className="empty-state">
-                    <div className="empty-icon">👥</div>
-                    <p>No customers registered yet.</p>
-                  </div>
-                ) : (
-                  <ul className="user-list">
-                    {allCustomers.map(customer => {
-                      const isOnline = activeCustomers.some(ac => ac.username === customer.username);
-                      return (
-                        <li key={customer.id} className="user-card">
-                          <div className="user-info">
-                            <span className="user-name">{customer.username}</span>
-                            <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
-                            <span className="user-role-tag" style={{ marginLeft: 6 }}>{isOnline ? 'Online' : 'Offline'}</span>
-                          </div>
-                          <button 
-                            className={`call-btn ${!isOnline ? 'offline-call' : ''}`} 
-                            onClick={() => dialCustomer(customer.id, customer.username, isOnline)}
-                            style={{ background: isOnline ? '' : 'var(--border)' }}
-                          >
-                            {isOnline ? '📞 Call' : '📡 Push Dial'}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
+                {(() => {
+                  const displayCustomers = [...allCustomers];
+                  activeCustomers.forEach(ac => {
+                    if (!displayCustomers.find(c => c.username === ac.username)) {
+                      displayCustomers.push({ id: ac.id, username: ac.username, isLiveOnly: true });
+                    }
+                  });
+
+                  if (displayCustomers.length === 0) {
+                    return (
+                      <div className="empty-state">
+                        <div className="empty-icon">👥</div>
+                        <p>No customers available.</p>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <ul className="user-list">
+                      {displayCustomers.map(customer => {
+                        const isOnline = activeCustomers.some(ac => ac.username === customer.username || ac.userId === customer.id);
+                        return (
+                          <li key={customer.id} className="user-card">
+                            <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <span className="user-name">{customer.username}</span>
+                                <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
+                                <span className="user-role-tag" style={{ marginLeft: 0 }}>{isOnline ? 'Online' : 'Offline'}</span>
+                              </div>
+                              {customer.phone && customer.phone !== customer.username && (
+                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.7 }}>📱 {customer.phone}</span>
+                              )}
+                            </div>
+                            {isOnline ? (
+                              <button
+                                className="call-btn"
+                                onClick={() => dialCustomer(customer.id, customer.username, true)}
+                              >
+                                📞 Call
+                              </button>
+                            ) : customer.hasPush ? (
+                              <button
+                                className="call-btn offline-call"
+                                onClick={() => dialCustomer(customer.id, customer.username, false)}
+                                style={{ background: 'var(--border)' }}
+                              >
+                                📡 Push Dial
+                              </button>
+                            ) : (
+                              <span style={{ fontSize: '12px', color: 'var(--text-secondary)', opacity: 0.6 }}>Offline</span>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  );
+                })()}
               </>
             ) : (
               /* ── History Tab ───────────────────────────────────────── */

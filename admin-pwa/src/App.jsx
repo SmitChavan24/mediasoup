@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupMonitor } from './lib/mediasoupClient';
 
-const SERVER_URL = '';
+const SERVER_URL = 'http://localhost:3005';
 const STORAGE_KEY = 'voip_admin_session';
 
 function getStoredSession() {
