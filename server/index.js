@@ -113,6 +113,17 @@ const pendingRings = {};      // callId → { interval, sub, targetDbId }
 const globalOfflineTargets = {}; // targetDbId → { callId, callerUsername, callerRole, targetRole }
 const PUSH_DIAL_TIMEOUT_MS = parseInt(process.env.PUSH_DIAL_TIMEOUT_MS, 10) || 60000;
 
+// ── Round-robin agent assignment ─────────────────────────────────────────────
+// `callIn` (the general queue) rings one agent at a time in rotation rather than
+// broadcasting to everyone. If an agent rejects or doesn't answer within
+// RING_TIMEOUT_MS we advance to the next free agent. If no agent is free the
+// call waits in `callQueue` until one frees up or connects.
+const RING_TIMEOUT_MS = parseInt(process.env.RING_TIMEOUT_MS, 10) || 20000;
+const ringTimers = {};        // callId → setTimeout (per-agent ring window)
+const ringingAgents = {};     // agentSocketId → callId (agent currently being rung)
+const callQueue = [];         // FIFO of callIds waiting for a free agent
+let rrCursor = 0;             // rotating pointer across the available-agent list
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function clearPendingRings(callId) {
@@ -212,6 +223,8 @@ async function fullCleanup(socketId) {
       }
 
       clearPendingRings(callId);
+      clearRing(callId);
+      removeFromQueue(callId);
       delete callRouters[callId];
       await deleteCall(callId);
     }
@@ -226,6 +239,9 @@ async function fullCleanup(socketId) {
 
   // Notify admin dashboards
   io.to('admins').emit('callsUpdated');
+
+  // Freed an agent and/or removed a waiting customer — re-balance the queue.
+  await processQueue();
 
   console.log(`[cleanup] 🧹 Full cleanup complete for socket=${socketId} user=${user.username}`);
 }
@@ -243,6 +259,134 @@ function closeLocalMediasoup(socketId) {
   delete localConsumers[socketId];
 }
 
+// ── Round-robin helpers ───────────────────────────────────────────────────────
+
+function clearRingTimer(callId) {
+  if (ringTimers[callId]) {
+    clearTimeout(ringTimers[callId]);
+    delete ringTimers[callId];
+  }
+}
+
+function clearRingingForCall(callId) {
+  for (const [agentId, cid] of Object.entries(ringingAgents)) {
+    if (cid === callId) delete ringingAgents[agentId];
+  }
+}
+
+// Stop ringing a call entirely: cancel its timer and release any rung agent.
+function clearRing(callId) {
+  clearRingTimer(callId);
+  clearRingingForCall(callId);
+}
+
+function removeFromQueue(callId) {
+  const i = callQueue.indexOf(callId);
+  if (i !== -1) callQueue.splice(i, 1);
+}
+
+// Connected agents who are not in a call, not already being rung, and not excluded.
+async function getAvailableAgents(excludeIds = []) {
+  const agents = await getPresenceList('agent'); // already filtered to status='connected'
+  const out = [];
+  for (const a of agents) {
+    if (excludeIds.includes(a.id)) continue;
+    if (!io.sockets.sockets.has(a.id)) continue;
+    const u = await getUser(a.id);
+    if (u && (!u.callId || u.callId === '')) out.push(a);
+  }
+  return out;
+}
+
+// Ring the next eligible agent for a queue-mode call, or park it in the queue.
+async function ringNextAgent(callId, callerUsername) {
+  const call = await getCall(callId);
+  if (!call || call.accepted === 'true') {
+    clearRing(callId);
+    return;
+  }
+
+  // Customer gone while we were routing — tear the call down.
+  if (!call.customerSocketId || !io.sockets.sockets.has(call.customerSocketId)) {
+    clearRing(callId);
+    removeFromQueue(callId);
+    delete callRouters[callId];
+    await deleteCall(callId);
+    m.activeCallsGauge.dec();
+    return;
+  }
+
+  // Release the previously-rung agent for this call, then pick a fresh one.
+  clearRing(callId);
+
+  const tried = (call.triedAgents || '').split(',').filter(Boolean);
+  const exclude = [...tried, ...Object.keys(ringingAgents)];
+  const available = await getAvailableAgents(exclude);
+
+  if (available.length === 0) {
+    // Nobody to ring right now — wait. Reset tried so a freshly-freed agent rings cleanly.
+    await updateCall(callId, { ringingAgent: '', triedAgents: '' });
+    if (!callQueue.includes(callId)) callQueue.push(callId);
+    const cust = io.sockets.sockets.get(call.customerSocketId);
+    if (cust) cust.emit('callStateUpdate', 'Waiting for an agent…');
+    console.log(`[rr] 🕓 callId=${callId} queued — no free agent (queue=${callQueue.length})`);
+    return;
+  }
+
+  const agent = available[rrCursor % available.length];
+  rrCursor = (rrCursor + 1) % 1e6;
+
+  ringingAgents[agent.id] = callId;
+  await updateCall(callId, {
+    ringingAgent: agent.id,
+    triedAgents: [...tried, agent.id].join(','),
+  });
+  removeFromQueue(callId);
+
+  const agentSocket = io.sockets.sockets.get(agent.id);
+  if (!agentSocket) {
+    // Vanished between the presence read and now — try the next one immediately.
+    return ringNextAgent(callId, callerUsername);
+  }
+
+  console.log(`[rr] 🔔 Ringing ${agent.username} (${agent.id}) for callId=${callId}`);
+  agentSocket.emit('incomingCall', { callId, from: callerUsername, role: 'customer' });
+  const cust = io.sockets.sockets.get(call.customerSocketId);
+  if (cust) cust.emit('callStateUpdate', 'Ringing…');
+
+  ringTimers[callId] = setTimeout(async () => {
+    console.log(`[rr] ⏰ ${agent.username} did not answer callId=${callId} — advancing`);
+    const s = io.sockets.sockets.get(agent.id);
+    if (s) s.emit('incomingCallCancelled', { callId });
+    await ringNextAgent(callId, callerUsername);
+  }, RING_TIMEOUT_MS);
+}
+
+// An agent just became free/connected — try to assign any waiting calls.
+async function processQueue() {
+  if (callQueue.length === 0) return;
+  for (const callId of [...callQueue]) {
+    const available = await getAvailableAgents(Object.keys(ringingAgents));
+    if (available.length === 0) break;
+
+    const call = await getCall(callId);
+    if (!call || call.accepted === 'true') {
+      removeFromQueue(callId);
+      continue;
+    }
+    if (!call.customerSocketId || !io.sockets.sockets.has(call.customerSocketId)) {
+      removeFromQueue(callId);
+      delete callRouters[callId];
+      await deleteCall(callId);
+      m.activeCallsGauge.dec();
+      continue;
+    }
+
+    const customerUser = await getUser(call.customerSocketId);
+    await ringNextAgent(callId, customerUser?.username || 'Customer');
+  }
+}
+
 /**
  * endCall — called on explicit hangup.  Cleans up both parties immediately
  * (no grace period since this is an intentional hangup).
@@ -254,6 +398,9 @@ async function endCall(socket) {
   const callId = user.callId;
   const call = await getCall(callId);
   if (!call) return;
+
+  clearRing(callId);
+  removeFromQueue(callId);
 
   // Record call duration + metrics
   let durationSec = 0;
@@ -316,6 +463,9 @@ async function endCall(socket) {
 
   // Notify admin dashboards
   io.to('admins').emit('callsUpdated');
+
+  // An agent likely just freed up — service any queued calls.
+  await processQueue();
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -384,6 +534,8 @@ async function main() {
         if (age > 120000 && !agentExists && !customerExists) {
           console.log(`[gc] 🧹 Cleaning stale call: ${callId} (age=${Math.round(age/1000)}s)`);
           clearPendingRings(callId);
+          clearRing(callId);
+          removeFromQueue(callId);
           delete callRouters[callId];
           await deleteCall(callId);
           m.activeCallsGauge.dec();
@@ -452,6 +604,9 @@ async function main() {
 
     // Admins don't appear in agent/customer presence — only broadcast for agents & customers
     await broadcastPresence();
+
+    // A newly-connected agent can take a waiting call.
+    if (role === 'agent') await processQueue();
 
     // Attach application-level heartbeat
     attachHeartbeat(socket, async (timedOutSocket) => {
@@ -1084,12 +1239,9 @@ async function main() {
         console.error(`[callIn] ❌ Failed to insert call history:`, err);
       }
 
-      // Notify all agents
-      io.to('agents').emit('incomingCall', {
-        callId,
-        from: callerUser.username,
-        role: 'customer'
-      });
+      // Round-robin: ring one agent at a time instead of broadcasting to all
+      await updateCall(callId, { mode: 'queue' });
+      await ringNextAgent(callId, callerUser.username);
 
       // Notify admin dashboards about new call
       io.to('admins').emit('callsUpdated');
@@ -1104,6 +1256,14 @@ async function main() {
       }
 
       const user = await getUser(socket.id);
+
+      // Round-robin guard: for queue calls, only the agent currently being rung
+      // may accept — a timed-out agent must not steal a call already routed on.
+      if (call.mode === 'queue' && call.ringingAgent && call.ringingAgent !== socket.id) {
+        return cb({ error: 'This call has already been routed to another agent.' });
+      }
+      clearRing(callId);
+      removeFromQueue(callId);
 
       // If this was a general 'callIn' and the agent is answering, assign the agent socket
       if (user.role === 'agent' && !call.agentSocketId) {
@@ -1160,6 +1320,18 @@ async function main() {
     // ── REJECT CALL ──────────────────────────────────────────────────────
     socket.on('rejectCall', async ({ callId }, cb) => {
       console.log(`[rejectCall] ❌ Call ${callId} rejected by socket=${socket.id}`);
+
+      // Round-robin: an agent passing on a queued call doesn't end it — ring the
+      // next agent and keep the customer waiting. The agent was never assigned
+      // (callId is only set on accept), so there's no agent state to clear.
+      const rrCall = await getCall(callId);
+      if (rrCall && rrCall.mode === 'queue' && rrCall.accepted !== 'true') {
+        clearRing(callId);
+        const customerUser = await getUser(rrCall.customerSocketId);
+        await ringNextAgent(callId, customerUser?.username || 'Customer');
+        if (typeof cb === 'function') cb({ ok: true });
+        return;
+      }
 
       // Update call history DB
       try {
@@ -1311,6 +1483,26 @@ async function main() {
       }
 
       if (user.callId && user.callId !== '') {
+        clearRing(user.callId);
+        removeFromQueue(user.callId);
+
+        // If the call never connected (still ringing/queued), there's nothing to
+        // reconnect to — clean up immediately and re-balance the queue, no grace.
+        const dcCall = await getCall(user.callId);
+        if (dcCall && dcCall.accepted !== 'true') {
+          console.log(`[disconnect] 🚪 ${user.username} left before connect — cleaning up callId=${user.callId}`);
+          clearPendingRings(user.callId);
+          delete callRouters[user.callId];
+          await deleteCall(user.callId);
+          m.activeCallsGauge.dec();
+          await removeFromPresence(user.role, socket.id);
+          await deleteUser(socket.id);
+          await broadcastPresence();
+          io.to('admins').emit('callsUpdated');
+          await processQueue();
+          return;
+        }
+
         // User was in a call — start grace period instead of immediate cleanup
         console.log(`[disconnect] ⏱️  Starting ${GRACE_PERIOD_SECONDS}s grace period for ${user.username} (callId=${user.callId})`);
 

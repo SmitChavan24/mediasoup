@@ -372,6 +372,11 @@ function App() {
       setIncomingCall({ callId, from, role });
     });
 
+    // Round-robin moved this call on to another agent — drop our popup.
+    s.on('incomingCallCancelled', ({ callId }) => {
+      setIncomingCall((prev) => (prev && prev.callId === callId ? null : prev));
+    });
+
     s.on('callStateUpdate', (newState) => {
       setActiveCall((prev) => prev ? { ...prev, state: newState } : null);
     });
