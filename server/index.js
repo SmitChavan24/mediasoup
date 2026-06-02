@@ -1830,10 +1830,11 @@ async function main() {
 
   // ── Immediate snapshot on startup + periodic console logging ─────────────
   startPeriodicLog();
-  server.listen(3005, () => {
-    console.log('Server running on port 3000');
-    console.log('Prometheus metrics available at http://localhost:3000/metrics');
-    console.log('Redis health available at http://localhost:3000/redis-health');
+  const PORT = parseInt(process.env.PORT, 10) || 3005;
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Prometheus metrics available at http://localhost:${PORT}/metrics`);
+    console.log(`Redis health available at http://localhost:${PORT}/redis-health`);
     // Print an initial snapshot right away so the first log isn't 60s away
     printMetricsSnapshot();
   });

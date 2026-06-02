@@ -7,7 +7,8 @@ module.exports = {
       cwd: "/home/ubuntu/mediasoup/server",
       env: {
         NODE_ENV: "production",
-        // index.js currently calls server.listen(3005)
+        // 3005 is taken by tglevel_dashboard on the prod instance; mediasoup gets its own port.
+        PORT: 3006,
       },
       instances: 1,           // mediasoup keeps C++ workers in-process; do NOT cluster this
       autorestart: true,
