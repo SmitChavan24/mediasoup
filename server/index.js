@@ -36,7 +36,13 @@ const { attachHeartbeat } = require('./heartbeat');
 const { registerUser, loginUser, verifyToken } = require('./auth');
 const { createPool, initDatabase } = require('./db');
 const mysql2 = require('mysql2/promise');
-const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername } = require('./callHistory');
+const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername, setRecordingPath } = require('./callHistory');
+const fs = require('fs');
+const path = require('path');
+
+// Directory where uploaded call recordings are stored.
+const RECORDINGS_DIR = path.join(__dirname, 'recordings');
+fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 let tgPool;       // AWS Remote DB (Names & Info)
 let localTgPool;  // Local DB (Push Subscriptions & PWA Operations)
@@ -145,6 +151,33 @@ async function broadcastPresence() {
     getPresenceList('agent'),
     getPresenceList('customer'),
   ]);
+
+  // Enrich the roster with live call pairing so every agent can see which
+  // customer is on a call and with which agent. Only connected (accepted)
+  // calls count as "busy".
+  const activeCalls = await getAllActiveCalls();
+  const callByCustomerSocket = {};
+  const callByAgentSocket = {};
+  for (const c of activeCalls) {
+    if (!c.accepted) continue;
+    if (c.customerSocketId) callByCustomerSocket[c.customerSocketId] = c;
+    if (c.agentSocketId) callByAgentSocket[c.agentSocketId] = c;
+  }
+  for (const cust of customers) {
+    const call = callByCustomerSocket[cust.id];
+    if (call) {
+      cust.onCall = true;
+      cust.withAgent = call.agent;
+      cust.withAgentSocketId = call.agentSocketId;
+    }
+  }
+  for (const ag of agents) {
+    const call = callByAgentSocket[ag.id];
+    if (call) {
+      ag.onCall = true;
+      ag.withCustomer = call.customer;
+    }
+  }
 
   // Update Prometheus gauges
   m.activeUsersGauge.set({ role: 'agent' }, agents.length);
@@ -466,6 +499,9 @@ async function endCall(socket) {
 
   // An agent likely just freed up — service any queued calls.
   await processQueue();
+
+  // Refresh the roster so the busy badge clears for this customer/agent.
+  await broadcastPresence();
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -1277,6 +1313,9 @@ async function main() {
       await updateCall(callId, { accepted: 'true' });
       io.to('admins').emit('callsUpdated');
 
+      // Refresh the roster so all agents see this customer is now busy.
+      await broadcastPresence();
+
       // Clear any pending push ring loops natively
       clearPendingRings(callId);
 
@@ -1726,6 +1765,41 @@ async function main() {
       res.status(500).json({ error: 'Failed to fetch call history.' });
     }
   });
+
+  // ── Call recording upload ─────────────────────────────────────────────────
+  // The agent client records the mixed call audio (local mic + remote) and
+  // POSTs the raw blob here on hangup. Body is the audio bytes (audio/webm).
+  app.post(
+    '/api/recordings/:callId',
+    authMiddleware,
+    express.raw({ type: 'audio/*', limit: '100mb' }),
+    async (req, res) => {
+      try {
+        const rawCallId = req.params.callId || '';
+        // Guard against path traversal — callIds are like "call_1712696400000".
+        if (!/^[A-Za-z0-9_-]+$/.test(rawCallId)) {
+          return res.status(400).json({ error: 'Invalid callId.' });
+        }
+        if (!req.body || !req.body.length) {
+          return res.status(400).json({ error: 'Empty recording body.' });
+        }
+        const fileName = `${rawCallId}.webm`;
+        const filePath = path.join(RECORDINGS_DIR, fileName);
+        await fs.promises.writeFile(filePath, req.body);
+        const relPath = `recordings/${fileName}`;
+        await setRecordingPath(rawCallId, relPath);
+        console.log(`[api] 🎙️ Saved recording for callId=${rawCallId} (${req.body.length} bytes)`);
+        res.json({ success: true, path: relPath });
+      } catch (err) {
+        console.error('[api] ❌ POST /api/recordings failed:', err);
+        res.status(500).json({ error: 'Failed to save recording.' });
+      }
+    }
+  );
+
+  // Serve recordings for admin playback. Access is via the non-guessable callId
+  // filename; only admins are linked to these paths in the call-history UI.
+  app.use('/recordings', express.static(RECORDINGS_DIR));
 
   // ── Prometheus scrape endpoint ────────────────────────────────────────────
   app.get('/metrics', async (_req, res) => {

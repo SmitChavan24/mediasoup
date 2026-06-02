@@ -32,7 +32,7 @@ function persistCallState(callId, socketId) {
   localStorage.setItem(CALL_STATE_KEY, JSON.stringify({ callId, socketId }));
 }
 
-export async function setupCall(socket, callId, onRemoteAudio) {
+export async function setupCall(socket, callId, onRemoteAudio, authToken) {
   _currentCallId = callId;
   persistCallState(callId, socket.id);
 
@@ -41,6 +41,81 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   let currentRecvTransport = null;
   const pendingProducers = [];
   const audioElements = [];
+
+  // ── Call recording: mix local mic + remote audio into one MediaRecorder ──
+  const recordingBaseUrl = (socket.io && socket.io.uri) || '';
+  let recAudioCtx = null;
+  let recMixDest = null;
+  let recRecorder = null;
+  let recChunks = [];
+
+  const ensureRecMixer = () => {
+    if (recMixDest) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      recAudioCtx = new Ctx();
+      recMixDest = recAudioCtx.createMediaStreamDestination();
+    } catch (e) {
+      console.warn('[rec] AudioContext unavailable, recording disabled', e);
+    }
+  };
+
+  const startRecorder = () => {
+    if (recRecorder || !recMixDest) return;
+    let options;
+    if (typeof MediaRecorder !== 'undefined' &&
+        MediaRecorder.isTypeSupported &&
+        MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      options = { mimeType: 'audio/webm;codecs=opus' };
+    }
+    try {
+      recRecorder = new MediaRecorder(recMixDest.stream, options);
+    } catch (e) {
+      console.warn('[rec] MediaRecorder init failed', e);
+      return;
+    }
+    recRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recChunks.push(e.data);
+    };
+    recRecorder.start(2000);
+    console.log('[rec] ▶️ recording started');
+  };
+
+  const addTrackToRecording = (track) => {
+    ensureRecMixer();
+    if (!recMixDest) return;
+    try {
+      const src = recAudioCtx.createMediaStreamSource(new MediaStream([track]));
+      src.connect(recMixDest);
+    } catch (e) {
+      console.warn('[rec] failed to add track to recording', e);
+      return;
+    }
+    startRecorder();
+  };
+
+  const stopRecordingAndUpload = () => {
+    if (!recRecorder) return;
+    const mimeType = recRecorder.mimeType || 'audio/webm';
+    recRecorder.onstop = () => {
+      try { if (recAudioCtx) recAudioCtx.close(); } catch { }
+      const blob = new Blob(recChunks, { type: mimeType });
+      recChunks = [];
+      if (!blob.size || !recordingBaseUrl) return;
+      fetch(`${recordingBaseUrl}/api/recordings/${callId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': mimeType,
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: blob,
+      })
+        .then(() => console.log('[rec] ⬆️ recording uploaded'))
+        .catch((e) => console.error('[rec] upload failed', e));
+    };
+    try { recRecorder.stop(); } catch { }
+    recRecorder = null;
+  };
 
   const handleNewProducer = async ({ producerId }) => {
     if (!isReady || !currentDevice || !currentRecvTransport) {
@@ -59,6 +134,7 @@ export async function setupCall(socket, callId, onRemoteAudio) {
     if (consumerParams.error) return console.error('Consume error:', consumerParams.error);
 
     const consumer = await currentRecvTransport.consume(consumerParams);
+    addTrackToRecording(consumer.track);
     const audio = new Audio();
     audio.srcObject = new MediaStream([consumer.track]);
     audio.autoplay = true;
@@ -100,7 +176,9 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   currentDevice = device;
 
   const sendParams = await new Promise(res => socket.emit('createSendTransport', res));
+  if (sendParams.error) throw new Error(`createSendTransport failed: ${sendParams.error}`);
   const recvParams = await new Promise(res => socket.emit('createRecvTransport', res));
+  if (recvParams.error) throw new Error(`createRecvTransport failed: ${recvParams.error}`);
   const sendTransport = device.createSendTransport({
     ...sendParams,
     iceServers: sendParams.iceServers,
@@ -159,8 +237,20 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   // Get mic audio and produce
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Check available devices first
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = devices.filter(d => d.kind === 'audioinput');
+    console.log('[mediasoup] Available audio inputs:', audioInputs.map(d => `${d.label || 'unnamed'} (${d.deviceId?.slice(0,8)})`));
+
+    if (audioInputs.length === 0) {
+      throw new Error('No microphone found. Please connect a mic and try again.');
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: audioInputs[0].deviceId ? { ideal: audioInputs[0].deviceId } : undefined }
+    });
     const track = stream.getAudioTracks()[0];
+    addTrackToRecording(track);
     await sendTransport.produce({ track });
   } catch (err) {
     console.error('Failed to get media devices:', err);
@@ -169,6 +259,7 @@ export async function setupCall(socket, callId, onRemoteAudio) {
   return {
     sendTransport, recvTransport, close: () => {
       _currentCallId = null;
+      stopRecordingAndUpload();
       audioElements.forEach(a => a.remove());
       stream?.getTracks().forEach(track => track.stop());
       sendTransport.close();

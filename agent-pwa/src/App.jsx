@@ -329,7 +329,7 @@ function App() {
             try {
               const callTransports = await setupCall(s, res.callId, () => {
                 console.log('Remote audio playing (reconnected)');
-              });
+              }, session?.token);
               callRef.current = callTransports;
             } catch (err) {
               console.error('[agent] Failed to restore media:', err);
@@ -440,10 +440,11 @@ function App() {
       try {
         const callTransports = await setupCall(socket, callId, () => {
           console.log('Remote audio playing');
-        });
+        }, session?.token);
         callRef.current = callTransports;
       } catch (err) {
-        alert('Could not setup media devices. Check permissions.');
+        console.error('[agent] setupCall failed:', err);
+        alert(`Call setup failed: ${err.message}`);
         endCall();
       }
     });
@@ -493,7 +494,8 @@ function App() {
           });
           callRef.current = callTransports;
         } catch (err) {
-          alert('Could not setup media devices. Check permissions.');
+          console.error('[agent] setupCall failed:', err);
+          alert(`Call setup failed: ${err.message}`);
           endCall();
         }
       });
@@ -665,20 +667,30 @@ function App() {
                   return (
                     <ul className="user-list">
                       {displayCustomers.map(customer => {
-                        const isOnline = activeCustomers.some(ac => ac.username === customer.username || ac.userId === customer.id);
+                        const liveInfo = activeCustomers.find(ac => ac.username === customer.username || ac.id === customer.id);
+                        const isOnline = !!liveInfo;
+                        const onCall = !!liveInfo?.onCall;
+                        const withAgent = liveInfo?.withAgent;
                         return (
                           <li key={customer.id} className="user-card">
                             <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                 <span className="user-name">{customer.username}</span>
-                                <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
-                                <span className="user-role-tag" style={{ marginLeft: 0 }}>{isOnline ? 'Online' : 'Offline'}</span>
+                                <span className={`status-dot ${onCall ? 'busy' : isOnline ? 'online' : ''}`} title={onCall ? 'On call' : isOnline ? 'Online' : 'Offline'}></span>
+                                <span className="user-role-tag" style={{ marginLeft: 0 }}>{onCall ? 'On call' : isOnline ? 'Online' : 'Offline'}</span>
                               </div>
+                              {onCall && (
+                                <span style={{ fontSize: '11px', color: 'var(--warning, #fbbf24)', fontWeight: 600 }}>
+                                  📞 On call with {withAgent || 'an agent'}
+                                </span>
+                              )}
                               {customer.phone && customer.phone !== customer.username && (
                                 <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.7 }}>📱 {customer.phone}</span>
                               )}
                             </div>
-                            {isOnline ? (
+                            {onCall ? (
+                              <span style={{ fontSize: '12px', color: 'var(--text-secondary)', opacity: 0.7 }}>Busy</span>
+                            ) : isOnline ? (
                               <button
                                 className="call-btn"
                                 onClick={() => dialCustomer(customer.id, customer.username, true)}

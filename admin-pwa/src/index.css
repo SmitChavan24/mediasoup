@@ -690,6 +690,32 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   white-space: nowrap;
 }
 
+/* ── Recording player ─────────────────────────────────────────────────── */
+.hc-recording {
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+}
+
+.hc-audio {
+  height: 34px;
+  flex: 1 1 220px;
+  min-width: 180px;
+  max-width: 360px;
+}
+
+.hc-download {
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.hc-download:hover {
+  color: var(--text-primary);
+}
+
 /* ── Pagination ───────────────────────────────────────────────────────── */
 .pagination {
   display: flex;

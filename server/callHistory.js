@@ -161,7 +161,7 @@ async function getCallHistory(filters = {}) {
     // Fetch page
     const [rows] = await pool.execute(
         `SELECT id, call_id, caller_name, caller_role, callee_name, callee_role,
-            status, started_at, answered_at, ended_at, duration_sec, call_date
+            status, started_at, answered_at, ended_at, duration_sec, recording_path, call_date
      FROM call_history ${whereClause}
      ORDER BY started_at DESC
      LIMIT ? OFFSET ?`,
@@ -176,4 +176,18 @@ async function getCallHistory(filters = {}) {
     };
 }
 
-module.exports = { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername };
+/**
+ * Save the recording file path for a call.
+ * @param {string} callId
+ * @param {string} relPath – path relative to the server (e.g. "recordings/call_x.webm")
+ */
+async function setRecordingPath(callId, relPath) {
+    const pool = getPool();
+    await pool.execute(
+        'UPDATE call_history SET recording_path = ? WHERE call_id = ?',
+        [relPath, callId]
+    );
+    console.log(`[callHistory] 🎙️ Saved recording_path for callId=${callId}`);
+}
+
+module.exports = { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername, setRecordingPath };

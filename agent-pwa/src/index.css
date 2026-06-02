@@ -205,6 +205,11 @@ button:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   box-shadow: 0 0 8px var(--success-color);
 }
 
+.status-dot.busy {
+  background: #fbbf24;
+  box-shadow: 0 0 8px #fbbf24;
+}
+
 .logout-btn {
   background: rgba(255, 255, 255, 0.06);
   color: var(--text-secondary);

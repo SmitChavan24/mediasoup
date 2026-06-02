@@ -640,6 +640,24 @@ function App() {
                       <span className="hc-detail">⏱️ {fmtDuration(row.duration_sec)}</span>
                       {row.ended_at && <span className="hc-detail">🏁 Ended {fmtTime(row.ended_at)}</span>}
                     </div>
+                    {row.recording_path && (
+                      <div className="hc-row hc-recording">
+                        <span className="hc-detail">🎙️ Recording</span>
+                        <audio
+                          controls
+                          preload="none"
+                          src={`${SERVER_URL}/${row.recording_path}`}
+                          className="hc-audio"
+                        />
+                        <a
+                          className="hc-detail hc-download"
+                          href={`${SERVER_URL}/${row.recording_path}`}
+                          download
+                        >
+                          ⬇️ Download
+                        </a>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

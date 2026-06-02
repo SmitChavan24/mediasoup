@@ -86,6 +86,7 @@ async function initDatabase() {
         answered_at  DATETIME NULL,
         ended_at     DATETIME NULL,
         duration_sec INT DEFAULT 0,
+        recording_path VARCHAR(255) NULL,
         call_date    DATE GENERATED ALWAYS AS (DATE(started_at)) STORED,
         INDEX idx_call_id (call_id),
         INDEX idx_caller (caller_id),
@@ -95,6 +96,21 @@ async function initDatabase() {
       )
     `);
     console.log('[db] ✅ call_history table ready');
+
+    // Add recording_path to pre-existing tables (CREATE TABLE IF NOT EXISTS
+    // won't alter an existing schema).
+    const [cols] = await conn.execute(
+      `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'call_history'
+           AND COLUMN_NAME = 'recording_path'`
+    );
+    if (cols[0].n === 0) {
+      await conn.execute(
+        `ALTER TABLE call_history ADD COLUMN recording_path VARCHAR(255) NULL AFTER duration_sec`
+      );
+      console.log('[db] ✅ added recording_path column to call_history');
+    }
   } finally {
     conn.release();
   }
