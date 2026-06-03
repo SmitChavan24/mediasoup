@@ -3,7 +3,8 @@ import { io } from 'socket.io-client';
 import { setupCall, getCurrentCallId, clearCurrentCallId, getPreviousSocketId } from './lib/mediasoupClient';
 import { ringtone } from './lib/ringtone';
 
-const SERVER_URL = 'http://localhost:3005';
+const SERVER_URL = 'https://voip.tglevels.in';
+
 const STORAGE_KEY = 'voip_agent_session';
 
 function getStoredSession() {
@@ -76,7 +77,7 @@ function App() {
   const [reconnecting, setReconnecting] = useState(false);
   const [peerDisconnected, setPeerDisconnected] = useState(null);
   const [activeCustomers, setActiveCustomers] = useState([]);
-  const [allCustomers, setAllCustomers] = useState([]);
+
 
   // Call history state
   const [showHistory, setShowHistory] = useState(false);
@@ -161,24 +162,7 @@ function App() {
     if (showHistory && session) fetchHistory();
   }, [showHistory, historyPage]);
 
-  // Fetch all registered customers for push dialing
-  useEffect(() => {
-    if (!showHistory && session) fetchAllCustomers();
-  }, [showHistory, session]);
 
-  const fetchAllCustomers = async () => {
-    if (!session) return;
-    try {
-      const res = await fetch(`${SERVER_URL}/api/customers`, {
-        headers: { Authorization: `Bearer ${session.token}` },
-      });
-      if (res.ok) {
-        setAllCustomers(await res.json());
-      }
-    } catch (err) {
-      console.error('[agent] Failed to fetch all customers:', err);
-    }
-  };
 
   // Handle page visibility to prevent mobile heartbeat timeouts
   useEffect(() => {
@@ -457,21 +441,11 @@ function App() {
     setIncomingCall(null);
   };
 
-  const dialCustomer = (customerDbId, customerName, isOnline) => {
+  const dialCustomer = (customerSocketId, customerName) => {
     if (dialingRef.current) return; // Prevent double-dial
     dialingRef.current = true;
 
-    // If the customer is online, find their transient socket ID for traditional dialing.
-    // If they are offline, we dial using targetUserId (DB ID) to trigger Push.
-    let pushDbId = customerDbId;
-    let fallbackTargetId = null;
-
-    if (isOnline) {
-      const activeObj = activeCustomers.find(c => c.username === customerName);
-      if (activeObj) fallbackTargetId = activeObj.id;
-    }
-
-    socket.emit('dialOut', { targetId: fallbackTargetId, targetUserId: pushDbId }, (res) => {
+    socket.emit('dialOut', { targetId: customerSocketId }, (res) => {
       dialingRef.current = false;
       if (res.error) {
         if (res.busy) {
@@ -484,7 +458,7 @@ function App() {
       }
 
       const { callId } = res;
-      setActiveCall({ callId, withUser: customerName, state: isOnline ? 'Calling...' : 'Sending Push Notification...' });
+      setActiveCall({ callId, withUser: customerName, state: 'Calling...' });
 
       socket.once('callAccepted', async () => {
         setActiveCall({ callId, withUser: customerName, state: 'Connected' });
@@ -647,73 +621,45 @@ function App() {
             {/* ── Customers Tab ─────────────────────────────────────── */}
             {!showHistory ? (
               <>
-                {(() => {
-                  const displayCustomers = [...allCustomers];
-                  activeCustomers.forEach(ac => {
-                    if (!displayCustomers.find(c => c.username === ac.username)) {
-                      displayCustomers.push({ id: ac.id, username: ac.username, isLiveOnly: true });
-                    }
-                  });
-
-                  if (displayCustomers.length === 0) {
-                    return (
-                      <div className="empty-state">
-                        <div className="empty-icon">👥</div>
-                        <p>No customers available.</p>
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <ul className="user-list">
-                      {displayCustomers.map(customer => {
-                        const liveInfo = activeCustomers.find(ac => ac.username === customer.username || ac.id === customer.id);
-                        const isOnline = !!liveInfo;
-                        const onCall = !!liveInfo?.onCall;
-                        const withAgent = liveInfo?.withAgent;
-                        return (
-                          <li key={customer.id} className="user-card">
-                            <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                <span className="user-name">{customer.username}</span>
-                                <span className={`status-dot ${onCall ? 'busy' : isOnline ? 'online' : ''}`} title={onCall ? 'On call' : isOnline ? 'Online' : 'Offline'}></span>
-                                <span className="user-role-tag" style={{ marginLeft: 0 }}>{onCall ? 'On call' : isOnline ? 'Online' : 'Offline'}</span>
-                              </div>
-                              {onCall && (
-                                <span style={{ fontSize: '11px', color: 'var(--warning, #fbbf24)', fontWeight: 600 }}>
-                                  📞 On call with {withAgent || 'an agent'}
-                                </span>
-                              )}
-                              {customer.phone && customer.phone !== customer.username && (
-                                <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.7 }}>📱 {customer.phone}</span>
-                              )}
+                {activeCustomers.length === 0 ? (
+                  <div className="empty-state">
+                    <div className="empty-icon">👥</div>
+                    <p>No customers online.</p>
+                  </div>
+                ) : (
+                  <ul className="user-list">
+                    {activeCustomers.map(customer => {
+                      const onCall = !!customer.onCall;
+                      const withAgent = customer.withAgent;
+                      return (
+                        <li key={customer.id} className="user-card">
+                          <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span className="user-name">{customer.username}</span>
+                              <span className={`status-dot ${onCall ? 'busy' : 'online'}`} title={onCall ? 'On call' : 'Online'}></span>
+                              <span className="user-role-tag" style={{ marginLeft: 0 }}>{onCall ? 'On call' : 'Online'}</span>
                             </div>
-                            {onCall ? (
-                              <span style={{ fontSize: '12px', color: 'var(--text-secondary)', opacity: 0.7 }}>Busy</span>
-                            ) : isOnline ? (
-                              <button
-                                className="call-btn"
-                                onClick={() => dialCustomer(customer.id, customer.username, true)}
-                              >
-                                📞 Call
-                              </button>
-                            ) : customer.hasPush ? (
-                              <button
-                                className="call-btn offline-call"
-                                onClick={() => dialCustomer(customer.id, customer.username, false)}
-                                style={{ background: 'var(--border)' }}
-                              >
-                                📡 Push Dial
-                              </button>
-                            ) : (
-                              <span style={{ fontSize: '12px', color: 'var(--text-secondary)', opacity: 0.6 }}>Offline</span>
+                            {onCall && (
+                              <span style={{ fontSize: '11px', color: 'var(--warning, #fbbf24)', fontWeight: 600 }}>
+                                📞 On call with {withAgent || 'an agent'}
+                              </span>
                             )}
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  );
-                })()}
+                          </div>
+                          {onCall ? (
+                            <span style={{ fontSize: '12px', color: 'var(--text-secondary)', opacity: 0.7 }}>Busy</span>
+                          ) : (
+                            <button
+                              className="call-btn"
+                              onClick={() => dialCustomer(customer.id, customer.username)}
+                            >
+                              📞 Call
+                            </button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
               </>
             ) : (
               /* ── History Tab ───────────────────────────────────────── */

@@ -2,7 +2,8 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupMonitor } from './lib/mediasoupClient';
 
-const SERVER_URL = 'http://localhost:3005';
+const SERVER_URL = 'https://voip.tglevels.in';
+
 const STORAGE_KEY = 'voip_admin_session';
 
 function getStoredSession() {
@@ -47,8 +48,8 @@ function fmtTime(dt) {
 function StatusBadge({ status }) {
   const colors = {
     completed: { bg: 'rgba(16,185,129,0.2)', color: '#34d399', label: '✅ Completed' },
-    missed:    { bg: 'rgba(251,191,36,0.2)', color: '#fbbf24', label: '📞 Missed' },
-    rejected:  { bg: 'rgba(239,68,68,0.2)',  color: '#f87171', label: '❌ Rejected' },
+    missed: { bg: 'rgba(251,191,36,0.2)', color: '#fbbf24', label: '📞 Missed' },
+    rejected: { bg: 'rgba(239,68,68,0.2)', color: '#f87171', label: '❌ Rejected' },
   };
   const c = colors[status] || colors.missed;
   return (
