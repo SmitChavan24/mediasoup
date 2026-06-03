@@ -363,6 +363,9 @@ async function ringNextAgent(callId, callerUsername) {
     const cust = io.sockets.sockets.get(call.customerSocketId);
     if (cust) cust.emit('callStateUpdate', 'Waiting for an agent…');
     console.log(`[rr] 🕓 callId=${callId} queued — no free agent (queue=${callQueue.length})`);
+
+    // Re-try after 5s — the agent who just declined is now free again
+    setTimeout(() => processQueue(), 5000);
     return;
   }
 
