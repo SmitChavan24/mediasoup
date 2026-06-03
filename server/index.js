@@ -204,6 +204,16 @@ async function fullCleanup(socketId) {
   if (callId && callId !== '') {
     const call = await getCall(callId);
     if (call) {
+      // If a queue call is still ringing an agent, notify them to dismiss the banner
+      if (call.ringingAgent) {
+        const ringingSocket = io.sockets.sockets.get(call.ringingAgent);
+        if (ringingSocket) {
+          ringingSocket.emit('incomingCallCancelled', { callId });
+        }
+      }
+      clearRing(callId);
+      removeFromQueue(callId);
+
       // Find the other party
       const otherSocketId = call.agentSocketId === socketId
         ? call.customerSocketId
@@ -434,6 +444,14 @@ async function endCall(socket) {
   const callId = user.callId;
   const call = await getCall(callId);
   if (!call) return;
+
+  // If a queue call is still ringing an agent, notify them to dismiss the banner
+  if (call.ringingAgent) {
+    const ringingSocket = io.sockets.sockets.get(call.ringingAgent);
+    if (ringingSocket) {
+      ringingSocket.emit('incomingCallCancelled', { callId });
+    }
+  }
 
   clearRing(callId);
   removeFromQueue(callId);
