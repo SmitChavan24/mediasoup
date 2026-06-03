@@ -1420,6 +1420,9 @@ async function main() {
 
         // Notify admins
         io.to('admins').emit('callsUpdated');
+
+        // Broadcast updated presence so customer list refreshes immediately
+        await broadcastPresence();
       }
 
       if (typeof cb === 'function') cb({ ok: true });

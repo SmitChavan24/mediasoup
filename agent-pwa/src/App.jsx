@@ -626,7 +626,7 @@ function App() {
                     <div className="empty-icon">👥</div>
                     <p>No customers online.</p>
                   </div>
-                ) : (
+                ) : incomingCall ? null : (
                   <ul className="user-list">
                     {activeCustomers.map(customer => {
                       const onCall = !!customer.onCall;
