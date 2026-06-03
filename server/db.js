@@ -111,6 +111,19 @@ async function initDatabase() {
       );
       console.log('[db] ✅ added recording_path column to call_history');
     }
+    // Add call_type column for queue vs direct call tracking
+    const [typeCols] = await conn.execute(
+      `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'call_history'
+           AND COLUMN_NAME = 'call_type'`
+    );
+    if (typeCols[0].n === 0) {
+      await conn.execute(
+        `ALTER TABLE call_history ADD COLUMN call_type VARCHAR(10) DEFAULT 'direct' AFTER recording_path`
+      );
+      console.log('[db] ✅ added call_type column to call_history');
+    }
   } finally {
     conn.release();
   }

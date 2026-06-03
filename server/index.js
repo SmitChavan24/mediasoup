@@ -246,10 +246,21 @@ async function fullCleanup(socketId) {
 
       // ── Persist call history (fullCleanup path) ──────────────────────
       try {
-        await updateCallRecord(callId, {
+        const historyUpdate = {
           ended_at: true,
           duration_sec: durationSec,
-        });
+        };
+
+        // For queue calls that were never accepted, record the last ringing agent
+        if (call.ringingAgent && call.accepted !== 'true') {
+          const ringingUser = await getUser(call.ringingAgent);
+          if (ringingUser) {
+            historyUpdate.callee_name = ringingUser.username;
+            historyUpdate.callee_role = ringingUser.role;
+          }
+        }
+
+        await updateCallRecord(callId, historyUpdate);
       } catch (err) {
         console.error(`[fullCleanup] ❌ Failed to update call history:`, err);
       }
@@ -469,10 +480,21 @@ async function endCall(socket) {
 
   // ── Persist call history ──────────────────────────────────────────────
   try {
-    await updateCallRecord(callId, {
+    const historyUpdate = {
       ended_at: true,
       duration_sec: durationSec,
-    });
+    };
+
+    // For queue calls that were never accepted, record the last ringing agent
+    if (call.ringingAgent && call.accepted !== 'true') {
+      const ringingUser = await getUser(call.ringingAgent);
+      if (ringingUser) {
+        historyUpdate.callee_name = ringingUser.username;
+        historyUpdate.callee_role = ringingUser.role;
+      }
+    }
+
+    await updateCallRecord(callId, historyUpdate);
   } catch (err) {
     console.error(`[endCall] ❌ Failed to update call history:`, err);
   }
@@ -1024,6 +1046,7 @@ async function main() {
               callerRole: callerUser?.role || null,
               calleeName: activeTargetUser.username,
               calleeRole: activeTargetUser.role,
+              callType: 'direct',
             });
             await updateCallRecord(callId, { status: 'missed', ended_at: true });
           } catch (err) { }
@@ -1077,6 +1100,7 @@ async function main() {
           callerRole: callerUser.role,
           calleeName: targetUsername || finalTargetUser?.username || null,
           calleeRole: targetRole || finalTargetUser?.role || null,
+          callType: 'direct',
         });
       } catch (err) {
         console.error(`[dialOut] ❌ Failed to insert call history:`, err);
@@ -1291,6 +1315,7 @@ async function main() {
           callerRole: 'customer',
           calleeName: null,
           calleeRole: null,
+          callType: 'queue',
         });
       } catch (err) {
         console.error(`[callIn] ❌ Failed to insert call history:`, err);

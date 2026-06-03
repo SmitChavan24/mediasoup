@@ -618,7 +618,14 @@ function App() {
               </div>
             ) : (
               <div className="history-cards">
-                {history.map(row => (
+                {history.map(row => {
+                  // Smart duration: talk time for completed, ring time for missed
+                  const talkTime = row.status === 'completed' && row.answered_at && row.ended_at
+                    ? Math.round((new Date(row.ended_at) - new Date(row.answered_at)) / 1000)
+                    : null;
+                  const displayDuration = talkTime !== null ? talkTime : row.duration_sec;
+
+                  return (
                   <div key={row.id} className="history-card">
                     <div className="hc-row hc-row-top">
                       <div className="hc-direction">
@@ -634,11 +641,23 @@ function App() {
                           {row.callee_role && <span className={`role-tag ${row.callee_role}`}>{row.callee_role}</span>}
                         </div>
                       </div>
-                      <StatusBadge status={row.status} />
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '4px' }}>
+                        <StatusBadge status={row.status} />
+                        <span style={{
+                          fontSize: '10px', fontWeight: 600, padding: '2px 8px', borderRadius: '10px',
+                          background: row.call_type === 'queue' ? 'rgba(99,102,241,0.2)' : 'rgba(14,165,233,0.2)',
+                          color: row.call_type === 'queue' ? '#818cf8' : '#38bdf8',
+                        }}>
+                          {row.call_type === 'queue' ? '📥 Queue' : '📤 Direct'}
+                        </span>
+                      </div>
                     </div>
                     <div className="hc-row hc-row-bottom">
                       <span className="hc-detail">📅 {fmtDateTime(row.started_at)}</span>
-                      <span className="hc-detail">⏱️ {fmtDuration(row.duration_sec)}</span>
+                      {row.answered_at && <span className="hc-detail">📲 Answered {fmtTime(row.answered_at)}</span>}
+                      <span className="hc-detail" title={talkTime !== null ? 'Talk time' : 'Ring time'}>
+                        ⏱️ {fmtDuration(displayDuration)}{talkTime !== null ? '' : row.status === 'missed' ? ' (ring)' : ''}
+                      </span>
                       {row.ended_at && <span className="hc-detail">🏁 Ended {fmtTime(row.ended_at)}</span>}
                     </div>
                     {row.recording_path && (
@@ -659,8 +678,12 @@ function App() {
                         </a>
                       </div>
                     )}
+                    <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.25)', marginTop: '4px', fontFamily: 'monospace' }}>
+                      ID: {row.call_id}
+                    </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
