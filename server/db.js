@@ -124,6 +124,20 @@ async function initDatabase() {
       );
       console.log('[db] ✅ added call_type column to call_history');
     }
+
+    // Add ended_by column to track who hung up / rejected
+    const [endedByCols] = await conn.execute(
+      `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'call_history'
+           AND COLUMN_NAME = 'ended_by'`
+    );
+    if (endedByCols[0].n === 0) {
+      await conn.execute(
+        `ALTER TABLE call_history ADD COLUMN ended_by VARCHAR(50) NULL AFTER call_type`
+      );
+      console.log('[db] ✅ added ended_by column to call_history');
+    }
   } finally {
     conn.release();
   }

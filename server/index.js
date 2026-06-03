@@ -249,6 +249,7 @@ async function fullCleanup(socketId) {
         const historyUpdate = {
           ended_at: true,
           duration_sec: durationSec,
+          ended_by: user.username + ' (disconnected)',
         };
 
         // For queue calls that were never accepted, record the last ringing agent
@@ -483,6 +484,7 @@ async function endCall(socket) {
     const historyUpdate = {
       ended_at: true,
       duration_sec: durationSec,
+      ended_by: user.username,
     };
 
     // For queue calls that were never accepted, record the last ringing agent
@@ -1419,10 +1421,12 @@ async function main() {
       }
 
       // Update call history DB
+      const rejectUser = await getUser(socket.id);
       try {
         await updateCallRecord(callId, {
           status: 'rejected',
           ended_at: true,
+          ended_by: rejectUser?.username || 'Unknown',
         });
       } catch (err) {
         console.error(`[rejectCall] ❌ Failed to update call history:`, err);

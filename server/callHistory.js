@@ -93,6 +93,10 @@ async function updateCallRecord(callId, fields) {
         sets.push('callee_id = ?');
         values.push(fields.callee_id);
     }
+    if (fields.ended_by) {
+        sets.push('ended_by = ?');
+        values.push(fields.ended_by);
+    }
 
     if (sets.length === 0) return;
 
@@ -162,7 +166,7 @@ async function getCallHistory(filters = {}) {
     // Fetch page
     const [rows] = await pool.execute(
         `SELECT id, call_id, caller_name, caller_role, callee_name, callee_role,
-            status, started_at, answered_at, ended_at, duration_sec, recording_path, call_type, call_date
+            status, started_at, answered_at, ended_at, duration_sec, recording_path, call_type, ended_by, call_date
      FROM call_history ${whereClause}
      ORDER BY started_at DESC
      LIMIT ? OFFSET ?`,

@@ -659,6 +659,7 @@ function App() {
                         ⏱️ {fmtDuration(displayDuration)}{talkTime !== null ? '' : row.status === 'missed' ? ' (ring)' : ''}
                       </span>
                       {row.ended_at && <span className="hc-detail">🏁 Ended {fmtTime(row.ended_at)}</span>}
+                      {row.ended_by && <span className="hc-detail" style={{ color: '#f87171' }}>🚫 By: {row.ended_by}</span>}
                     </div>
                     {row.recording_path && (
                       <div className="hc-row hc-recording">
