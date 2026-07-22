@@ -34,7 +34,7 @@ const {
 } = require('./redisState');
 const { attachHeartbeat } = require('./heartbeat');
 const { registerUser, loginUser, verifyToken } = require('./auth');
-const { createPool, initDatabase } = require('./db');
+const { createPool, initDatabase, getPool } = require('./db');
 const mysql2 = require('mysql2/promise');
 const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername, setRecordingPath } = require('./callHistory');
 const fs = require('fs');
@@ -1853,6 +1853,180 @@ async function main() {
   // Serve recordings for admin playback. Access is via the non-guessable callId
   // filename; only admins are linked to these paths in the call-history UI.
   app.use('/recordings', express.static(RECORDINGS_DIR));
+
+  /* ── Callback requests ──────────────────────────────────────────────────
+     The customer never rings an agent. They leave a request, an agent picks
+     it up when convenient and dials out. Everything about the request and the
+     resulting call stays in this local database; the ONE thing that leaves is
+     a single "customer requested a callback" line injected into their Support
+     Board thread by PWA_NOTIFY, which is the only writer to that remote DB.
+
+     Created server-to-server: the PWA authenticates the customer with its own
+     session cookie and then calls this with the internal key, so a browser can
+     never post a callback for someone else's number.
+     ---------------------------------------------------------------------- */
+  const INTERNAL_KEY = process.env.INTERNAL_API_KEY || '';
+
+  function requireInternalKey(req, res, next) {
+    if (!INTERNAL_KEY || req.get('x-internal-key') !== INTERNAL_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+  }
+
+  const last10 = (v) => String(v == null ? '' : v).replace(/\D/g, '').slice(-10);
+
+  /* Which customers are reachable in the app right now.
+     Read straight off the live socket set rather than redis: PWA clients
+     authenticate with their PWA user_id (see the isPwaClient branch above),
+     and that id is on socket.user but is not part of the presence hash. This
+     is the same information without widening the stored state. */
+  function onlineCustomerIds() {
+    const ids = new Set();
+    for (const [, s] of io.of('/').sockets) {
+      if (s.user && s.user.role === 'customer' && s.user.userId) {
+        ids.add(String(s.user.userId));
+      }
+    }
+    return ids;
+  }
+
+  app.post('/api/callback', requireInternalKey, async (req, res) => {
+    try {
+      const phone = last10(req.body?.phone);
+      if (phone.length !== 10) {
+        return res.status(400).json({ error: 'Valid phone required.' });
+      }
+      const pwaUserId = String(req.body?.user_id || '').slice(0, 100) || null;
+      const name = String(req.body?.name || '').slice(0, 120) || null;
+
+      const pool = getPool();
+      let row;
+      try {
+        const [ins] = await pool.execute(
+          `INSERT INTO callback_requests (phone, pwa_user_id, name, source)
+           VALUES (?, ?, ?, 'pwa')`,
+          [phone, pwaUserId, name]
+        );
+        const [rows] = await pool.execute(
+          'SELECT * FROM callback_requests WHERE id = ?', [ins.insertId]
+        );
+        row = rows[0];
+      } catch (e) {
+        // The unique index on open_key is what enforces one open request per
+        // customer — a double tap loses the race in the database, not here.
+        if (e && e.code === 'ER_DUP_ENTRY') {
+          const [rows] = await pool.execute(
+            `SELECT * FROM callback_requests
+              WHERE phone = ? AND status IN ('pending','claimed') LIMIT 1`,
+            [phone]
+          );
+          return res.json({ success: true, duplicate: true, request: rows[0] || null });
+        }
+        throw e;
+      }
+
+      // Tell whoever is watching. Missing it is survivable — the panels also
+      // poll GET /api/callbacks, so a closed laptop does not lose a request.
+      io.to('agents').emit('callbackRequested', row);
+      io.to('admins').emit('callbackRequested', row);
+
+      console.log(`[callback] 📞 requested by ${phone} (id ${row.id})`);
+      res.json({ success: true, duplicate: false, request: row });
+    } catch (err) {
+      console.error('[api] ❌ POST /api/callback failed:', err);
+      res.status(500).json({ error: 'Failed to create callback request.' });
+    }
+  });
+
+  // Queue for the agent and admin panels. Online state is resolved from live
+  // presence, so an agent can see who is reachable in the app right now.
+  app.get('/api/callbacks', authMiddleware, async (req, res) => {
+    try {
+      const status = ['pending', 'claimed', 'done', 'cancelled'].includes(req.query.status)
+        ? req.query.status : null;
+      const pool = getPool();
+      const [rows] = status
+        ? await pool.execute(
+            `SELECT * FROM callback_requests WHERE status = ?
+              ORDER BY requested_at ASC LIMIT 500`, [status])
+        : await pool.execute(
+            `SELECT * FROM callback_requests WHERE status IN ('pending','claimed')
+              ORDER BY requested_at ASC LIMIT 500`);
+
+      const online = onlineCustomerIds();
+      res.json({
+        success: true,
+        count: rows.length,
+        // `online` is what tells an agent whether dialling out will actually
+        // ring anything — a closed PWA cannot be rung.
+        requests: rows.map((r) => ({
+          ...r,
+          online: Boolean(r.pwa_user_id && online.has(String(r.pwa_user_id))),
+        })),
+      });
+    } catch (err) {
+      console.error('[api] ❌ GET /api/callbacks failed:', err);
+      res.status(500).json({ error: 'Failed to fetch callbacks.' });
+    }
+  });
+
+  // Claim / release / close. Claiming is a conditional UPDATE so two agents
+  // grabbing the same request at once cannot both win.
+  app.post('/api/callbacks/:id/:action', authMiddleware, async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const action = req.params.action;
+      if (!Number.isInteger(id) || id < 1) {
+        return res.status(400).json({ error: 'Bad id.' });
+      }
+      const pool = getPool();
+      let result;
+
+      if (action === 'claim') {
+        [result] = await pool.execute(
+          `UPDATE callback_requests
+              SET status='claimed', claimed_by=?, claimed_at=NOW()
+            WHERE id=? AND status='pending'`,
+          [req.user.userId, id]
+        );
+        if (!result.affectedRows) {
+          return res.status(409).json({ error: 'Already taken by someone else.' });
+        }
+      } else if (action === 'release') {
+        [result] = await pool.execute(
+          `UPDATE callback_requests
+              SET status='pending', claimed_by=NULL, claimed_at=NULL
+            WHERE id=? AND status='claimed' AND claimed_by=?`,
+          [id, req.user.userId]
+        );
+        if (!result.affectedRows) {
+          return res.status(409).json({ error: 'Not yours to release.' });
+        }
+      } else if (action === 'close') {
+        const outcome = String(req.body?.outcome || '').slice(0, 255) || null;
+        [result] = await pool.execute(
+          `UPDATE callback_requests
+              SET status='done', closed_at=NOW(), outcome=?, last_call_id=?
+            WHERE id=? AND status IN ('pending','claimed')`,
+          [outcome, String(req.body?.call_id || '').slice(0, 64) || null, id]
+        );
+        if (!result.affectedRows) {
+          return res.status(409).json({ error: 'Already closed.' });
+        }
+      } else {
+        return res.status(400).json({ error: 'Unknown action.' });
+      }
+
+      const [rows] = await pool.execute('SELECT * FROM callback_requests WHERE id=?', [id]);
+      io.to('agents').emit('callbacksUpdated', rows[0]);
+      io.to('admins').emit('callbacksUpdated', rows[0]);
+      res.json({ success: true, request: rows[0] });
+    } catch (err) {
+      console.error('[api] ❌ callback action failed:', err);
+      res.status(500).json({ error: 'Action failed.' });
+    }
+  });
 
   // ── Prometheus scrape endpoint ────────────────────────────────────────────
   app.get('/metrics', async (_req, res) => {

@@ -11,6 +11,10 @@ module.exports = {
         PORT: 3006,
       },
       instances: 1,           // mediasoup keeps C++ workers in-process; do NOT cluster this
+      // `instances` alone makes PM2 pick cluster mode, which contradicts the
+      // line above and would fork a second copy the moment anyone raises the
+      // count. Stating fork explicitly keeps the intent enforced.
+      exec_mode: 'fork',
       autorestart: true,
       watch: false,
       max_memory_restart: "1G",
