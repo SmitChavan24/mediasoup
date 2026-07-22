@@ -35,6 +35,19 @@ const {
 const { attachHeartbeat } = require('./heartbeat');
 const { registerUser, loginUser, verifyToken } = require('./auth');
 const { createPool, initDatabase, getPool } = require('./db');
+
+/* Pilot allowlist: comma-separated PWA user ids that may be called while
+   testing. Empty (the default) means no restriction — so clearing the env var
+   is how this is switched off when the pilot ends. */
+const PILOT_USERS = new Set(
+  String(process.env.VOIP_PILOT_USERS || '')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+);
+console.log(
+  PILOT_USERS.size
+    ? `[pilot] 🔒 dial-out restricted to ${PILOT_USERS.size} test user(s): ${[...PILOT_USERS].join(', ')}`
+    : '[pilot] ⚠️  NO allowlist — any customer in the app can be dialled'
+);
 const mysql2 = require('mysql2/promise');
 const { insertCallRecord, updateCallRecord, getCallHistory, getUserIdByUsername, setRecordingPath } = require('./callHistory');
 const fs = require('fs');
@@ -1007,6 +1020,25 @@ async function main() {
     // Any-to-Any Direct Dial (Agent->Customer or Customer->Agent)
     socket.on('dialOut', async ({ targetId, targetUserId }, cb) => {
       const callId = `call_${Date.now()}`;
+
+      /* PILOT GUARD — remove by clearing VOIP_PILOT_USERS in .env.
+         The agent portal lists every customer currently in the app, which
+         during a pilot means several thousand real people are one tap away
+         from an unexpected incoming call. While the allowlist is set, only
+         those user ids can be dialled. Enforced here rather than by hiding
+         rows in the panel: a filtered UI is a suggestion, this is a rule. */
+      if (PILOT_USERS.size) {
+        const intended = String(
+          targetUserId || io.sockets.sockets.get(targetId)?.user?.userId || ''
+        );
+        if (!PILOT_USERS.has(intended)) {
+          console.warn(`[dialOut] ⛔ blocked call to ${intended || 'unknown'} — not in pilot allowlist`);
+          return cb({
+            error: 'Pilot mode: this customer is not on the test list.',
+            blocked: true,
+          });
+        }
+      }
 
       let targetSocket = null;
       let targetDbId = targetUserId;
