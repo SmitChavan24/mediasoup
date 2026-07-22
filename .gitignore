@@ -1,1 +1,3 @@
 /node_modules
+# Call recordings are runtime artefacts, not source
+server/recordings/*.webm
