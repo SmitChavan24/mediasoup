@@ -78,6 +78,9 @@ async function setUser(socketId, { username, role, status = 'connected' }) {
     status,
     callId: '',
     disconnectedAt: '',
+    // A fresh connection is assumed to be in the foreground — the client
+    // corrects this the instant it backgrounds via the 'visibility' event.
+    foreground: '1',
   });
 }
 
@@ -126,7 +129,13 @@ async function getPresenceList(role) {
   for (let i = 0; i < results.length; i++) {
     const [err, data] = results[i];
     if (!err && data && data.username && data.status === 'connected') {
-      users.push({ id: ids[i], username: data.username, role: data.role });
+      users.push({
+        id: ids[i],
+        username: data.username,
+        role: data.role,
+        // false only once the client has explicitly reported it backgrounded.
+        foreground: data.foreground !== '0',
+      });
     }
   }
   return users;

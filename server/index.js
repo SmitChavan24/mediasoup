@@ -192,12 +192,18 @@ async function broadcastPresence() {
     }
   }
 
+  // Only surface customers whose app is actually in the foreground — a
+  // backgrounded PWA still holds a socket but can't be rung, so showing it as
+  // "online" just sends agents to voicemail. Someone already on a call is kept
+  // visible so the roster still shows them as busy.
+  const reachableCustomers = customers.filter((c) => c.foreground || c.onCall);
+
   // Update Prometheus gauges
   m.activeUsersGauge.set({ role: 'agent' }, agents.length);
-  m.activeUsersGauge.set({ role: 'customer' }, customers.length);
+  m.activeUsersGauge.set({ role: 'customer' }, reachableCustomers.length);
 
   // Send the live roster to everyone
-  io.emit('presenceUpdate', { agents, customers });
+  io.emit('presenceUpdate', { agents, customers: reachableCustomers });
 }
 
 /**
@@ -651,6 +657,12 @@ async function main() {
     await setUser(socket.id, { username, role, status: 'connected' });
     await addToPresence(role, socket.id);
 
+    // Foreground tracking. A connected socket is NOT the same as a reachable
+    // one: a backgrounded PWA keeps its socket alive but cannot ring. So online
+    // means "app in the foreground", reported by the client below. Assume true
+    // on connect (they just opened it); the client corrects within a tick.
+    socket.data.foreground = true;
+
     if (role === 'agent') {
       socket.join('agents');
     } else if (role === 'customer') {
@@ -658,6 +670,15 @@ async function main() {
     } else if (role === 'admin') {
       socket.join('admins');
     }
+
+    // Client reports foreground/background via document.visibilityState.
+    socket.on('visibility', async ({ visible } = {}) => {
+      const fg = Boolean(visible);
+      if (socket.data.foreground === fg) return;
+      socket.data.foreground = fg;
+      try { await updateUser(socket.id, { foreground: fg ? '1' : '0' }); } catch {}
+      broadcastPresence();
+    });
 
     // ── Check Offline Call Handoff ──────────────────────────────────────────
     // If this user was dialed while offline, immediately alert them!
@@ -1916,7 +1937,10 @@ async function main() {
   function onlineCustomerIds() {
     const ids = new Set();
     for (const [, s] of io.of('/').sockets) {
-      if (s.user && s.user.role === 'customer' && s.user.userId) {
+      // foreground !== false: a socket mid-handshake hasn't reported yet and is
+      // treated as reachable until it says otherwise. A backgrounded PWA
+      // (foreground === false) is excluded — it can't actually be rung.
+      if (s.user && s.user.role === 'customer' && s.user.userId && s.data.foreground !== false) {
         ids.add(String(s.user.userId));
       }
     }
