@@ -463,9 +463,12 @@ function App() {
       socket.once('callAccepted', async () => {
         setActiveCall({ callId, withUser: customerName, state: 'Connected' });
         try {
+          // Pass the agent's token so the recording upload is authenticated —
+          // /api/recordings is auth-protected, and without it the POST 401s and
+          // the recording is silently lost (recording_path stays NULL).
           const callTransports = await setupCall(socket, callId, () => {
             console.log('Remote audio playing');
-          });
+          }, session?.token);
           callRef.current = callTransports;
         } catch (err) {
           console.error('[agent] setupCall failed:', err);
