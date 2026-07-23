@@ -253,7 +253,20 @@ export async function setupCall(socket, callId, onRemoteAudio, authToken) {
     addTrackToRecording(track);
     await sendTransport.produce({ track });
   } catch (err) {
+    // Tear down whatever was already created before rethrowing. Otherwise a
+    // failure here (most often the first-call mic-permission prompt) leaks the
+    // transports on both client and server, and the retry collides with the
+    // stale ones — the "MID already exists" / "Call not found" produce errors
+    // that made the first call fail and disconnect the panel.
     console.error('Failed to get media devices:', err);
+    try { stream?.getTracks().forEach(t => t.stop()); } catch (_) {}
+    try { if (recRecorder) recRecorder.stop(); } catch (_) {}
+    try { if (recAudioCtx) recAudioCtx.close(); } catch (_) {}
+    try { sendTransport.close(); } catch (_) {}
+    try { recvTransport.close(); } catch (_) {}
+    try { socket.off('newProducer', handleNewProducer); } catch (_) {}
+    _currentCallId = null;
+    isReady = false;
     throw err;
   }
   return {
