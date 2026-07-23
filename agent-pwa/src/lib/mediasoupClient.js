@@ -135,25 +135,30 @@ export async function setupCall(socket, callId, onRemoteAudio, authToken) {
 
     const consumer = await currentRecvTransport.consume(consumerParams);
     addTrackToRecording(consumer.track);
-    const audio = new Audio();
+
+    // In-DOM <audio> with playsinline, not `new Audio()` — a bare Audio object
+    // stays silent on iOS and the browser won't even pull RTP for it.
+    const audio = document.createElement('audio');
     audio.srcObject = new MediaStream([consumer.track]);
     audio.autoplay = true;
+    audio.muted = false;
     audio.volume = 1.0;
+    audio.setAttribute('playsinline', 'true');
+    audio.setAttribute('webkit-playsinline', 'true');
     audio.style.display = 'none';
     document.body.appendChild(audio);
     audioElements.push(audio);
 
-    try {
-      await audio.play();
-      console.log('[mediasoup] ✅ Remote audio playing');
-    } catch (e) {
-      console.warn('[mediasoup] ⚠️ Audio play blocked, retrying on user gesture:', e);
-      const resumeAudio = () => {
-        audio.play().then(() => {
-          console.log('[mediasoup] ✅ Audio resumed after user gesture');
-        }).catch(() => { });
-        document.removeEventListener('click', resumeAudio);
-        document.removeEventListener('touchstart', resumeAudio);
+    const tryPlay = async () => {
+      try { await audio.play(); return true; } catch (e) { return false; }
+    };
+    if (!(await tryPlay())) {
+      console.warn('[mediasoup] ⚠️ Audio play blocked — retrying on next gesture');
+      const resumeAudio = async () => {
+        if (await tryPlay()) {
+          document.removeEventListener('click', resumeAudio);
+          document.removeEventListener('touchstart', resumeAudio);
+        }
       };
       document.addEventListener('click', resumeAudio);
       document.addEventListener('touchstart', resumeAudio);
