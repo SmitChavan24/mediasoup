@@ -2,7 +2,9 @@ import React, { useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { setupMonitor } from './lib/mediasoupClient';
 
-const SERVER_URL = 'https://voip.tglevels.in';
+// Env-driven (Vite, baked at build) so a staging build can target a test voip
+// domain. Default = production. Set VITE_SERVER_URL to override at build time.
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://voip.tglevels.in';
 
 const STORAGE_KEY = 'voip_admin_session';
 
@@ -80,6 +82,7 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [activeCalls, setActiveCalls] = useState([]);
   const [monitoredCall, setMonitoredCall] = useState(null);
+  const [callbacks, setCallbacks] = useState([]); // pending/claimed callback requests
 
   // View: 'live' or 'history'
   const [currentView, setCurrentView] = useState('live');
@@ -272,6 +275,11 @@ function App() {
     s.on('connect', () => {
       setConnected(true);
       refreshCalls(s);
+      // Load the callback queue (also arrives live via socket below)
+      fetch(`${SERVER_URL}/api/callbacks`, { headers: { Authorization: `Bearer ${session?.token}` } })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d?.requests) setCallbacks(d.requests); })
+        .catch(() => {});
     });
 
     s.on('connect_error', (err) => {
@@ -291,6 +299,18 @@ function App() {
 
     s.on('callsUpdated', () => {
       refreshCalls(s);
+    });
+
+    // Callback queue — same events the agent panel gets, shown here in sync.
+    s.on('callbackRequested', (row) => {
+      setCallbacks((prev) => (prev.some((c) => c.id === row.id) ? prev : [{ ...row, online: true }, ...prev]));
+    });
+    s.on('callbacksUpdated', (row) => {
+      setCallbacks((prev) =>
+        ['done', 'cancelled'].includes(row.status)
+          ? prev.filter((c) => c.id !== row.id)
+          : prev.map((c) => (c.id === row.id ? { ...c, ...row } : c))
+      );
     });
 
     s.on('callEnded', () => {
@@ -508,7 +528,28 @@ function App() {
         {/* ── LIVE CALLS VIEW ────────────────────────────────────────── */}
         {currentView === 'live' && (
           <>
-            {activeCalls.length === 0 ? (
+            {/* ── Callback Requests (live, in sync with the agent panel) ── */}
+            {callbacks.length > 0 && (
+              <div style={{ marginBottom: '20px' }}>
+                <h2 style={{ fontSize: '15px', margin: '0 0 10px' }}>📞 Callback Requests ({callbacks.length})</h2>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {callbacks.map((cb) => {
+                    const name = cb.name && cb.name !== 'USER' && !/^pwaguest/i.test(cb.name) ? cb.name : (cb.phone || 'Customer');
+                    return (
+                      <div key={cb.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', padding: '10px 14px', background: 'var(--surface, #1e293b)', border: '1px solid var(--border, #334155)', borderLeft: '3px solid #1E9B22', borderRadius: '10px' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+                          <span style={{ fontWeight: 600 }}>{name} {cb.status === 'claimed' && <span style={{ fontSize: '11px', opacity: 0.7 }}>· claimed</span>}</span>
+                          <span style={{ fontSize: '11px', opacity: 0.7 }}>{cb.phone} · {fmtDateTime(cb.requested_at)}</span>
+                        </div>
+                        <span style={{ fontSize: '11px', color: cb.online ? '#22c55e' : '#94a3b8', whiteSpace: 'nowrap' }}>{cb.online ? '● online' : '○ offline'}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {activeCalls.length === 0 && callbacks.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">📞</div>
                 <h2>No Active Calls</h2>

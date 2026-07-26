@@ -3,7 +3,9 @@ import { io } from 'socket.io-client';
 import { setupCall, getCurrentCallId, clearCurrentCallId, getPreviousSocketId } from './lib/mediasoupClient';
 import { ringtone } from './lib/ringtone';
 
-const SERVER_URL = 'https://voip.tglevels.in';
+// Env-driven (Vite, baked at build) so a test build can target a staging voip
+// domain. Default = production. Set VITE_SERVER_URL to override at build time.
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://voip.tglevels.in';
 
 const STORAGE_KEY = 'voip_agent_session';
 
@@ -77,6 +79,7 @@ function App() {
   const [reconnecting, setReconnecting] = useState(false);
   const [peerDisconnected, setPeerDisconnected] = useState(null);
   const [activeCustomers, setActiveCustomers] = useState([]);
+  const [callbacks, setCallbacks] = useState([]); // pending/claimed callback requests
 
 
   // Call history state
@@ -331,6 +334,13 @@ function App() {
       previousSocketId.current = s.id;
       setConnected(true);
       s.emit('getPresence');
+
+      // Load the callback queue on every (re)connect so a closed laptop never
+      // loses requests that arrived while it was away.
+      fetch(`${SERVER_URL}/api/callbacks`, { headers: { Authorization: `Bearer ${session?.token}` } })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { if (d?.requests) setCallbacks(d.requests); })
+        .catch(() => {});
     });
 
     s.on('connect_error', (err) => {
@@ -350,6 +360,19 @@ function App() {
 
     s.on('presenceUpdate', ({ customers }) => {
       setActiveCustomers(customers);
+    });
+
+    // A customer just asked for a callback — surfaces here and on admin at once.
+    s.on('callbackRequested', (row) => {
+      setCallbacks((prev) => (prev.some((c) => c.id === row.id) ? prev : [{ ...row, online: true }, ...prev]));
+    });
+    // Claimed / released / closed by any agent — keep every panel in sync.
+    s.on('callbacksUpdated', (row) => {
+      setCallbacks((prev) =>
+        ['done', 'cancelled'].includes(row.status)
+          ? prev.filter((c) => c.id !== row.id)
+          : prev.map((c) => (c.id === row.id ? { ...c, ...row } : c))
+      );
     });
 
     s.on('incomingCall', ({ callId, from, role }) => {
@@ -441,15 +464,17 @@ function App() {
     setIncomingCall(null);
   };
 
-  const dialCustomer = (customerSocketId, customerName) => {
+  // Shared dial routine. `payload` is either { targetId } (a live socket, from
+  // the Customers list) or { targetUserId } (a user id, from a callback request
+  // — the server resolves it to their live socket, or pushes if offline).
+  const beginDial = (payload, customerName) => {
     if (dialingRef.current) return; // Prevent double-dial
     dialingRef.current = true;
 
-    socket.emit('dialOut', { targetId: customerSocketId }, (res) => {
+    socket.emit('dialOut', payload, (res) => {
       dialingRef.current = false;
       if (res.error) {
         if (res.busy) {
-          // Show call screen with busy state, then return to main after 3s
           setActiveCall({ withUser: customerName, state: 'On Another Call' });
           setTimeout(() => handleCallCleanup(), 3000);
           return;
@@ -477,6 +502,20 @@ function App() {
         }
       });
     });
+  };
+
+  const dialCustomer = (customerSocketId, customerName) => beginDial({ targetId: customerSocketId }, customerName);
+  const dialByUserId = (userId, customerName) => beginDial({ targetUserId: userId }, customerName);
+
+  // Mark a callback handled — removes it from every panel's queue.
+  const closeCallback = async (id) => {
+    try {
+      await fetch(`${SERVER_URL}/api/callbacks/${id}/close`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.token}` },
+        body: JSON.stringify({}),
+      });
+    } catch { /* the callbacksUpdated event will reconcile */ }
   };
 
   const endCall = () => {
@@ -624,6 +663,39 @@ function App() {
             {/* ── Customers Tab ─────────────────────────────────────── */}
             {!showHistory ? (
               <>
+                {/* ── Callback Requests queue (live via socket + fetch) ─── */}
+                {callbacks.length > 0 && (
+                  <div style={{ marginBottom: '16px' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 700, color: 'var(--text-secondary)', margin: '4px 4px 8px' }}>
+                      📞 Callback Requests ({callbacks.length})
+                    </div>
+                    <ul className="user-list">
+                      {callbacks.map((cb) => {
+                        const name = cb.name && cb.name !== 'USER' && !/^pwaguest/i.test(cb.name) ? cb.name : (cb.phone || 'Customer');
+                        const isOnline = !!cb.online;
+                        return (
+                          <li key={cb.id} className="user-card" style={{ borderLeft: '3px solid #1E9B22' }}>
+                            <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <span className="user-name">{name}</span>
+                                <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
+                                {cb.status === 'claimed' && <span className="user-role-tag" style={{ marginLeft: 0 }}>Claimed</span>}
+                              </div>
+                              <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
+                                {cb.phone} · {fmtDateTime(cb.requested_at)}
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                              <button className="call-btn" onClick={() => dialByUserId(cb.pwa_user_id, name)}>📞 Call</button>
+                              <button className="logout-btn" style={{ padding: '6px 10px' }} onClick={() => closeCallback(cb.id)}>Done</button>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                )}
+
                 {activeCustomers.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-icon">👥</div>
