@@ -85,6 +85,8 @@ function App() {
   const [searching, setSearching] = useState(false);
   const searchedPhoneRef = useRef(''); // last searched last-10-digits, for live updates
   const [isMuted, setIsMuted] = useState(false);     // agent mic muted mid-call
+  const [micLevel, setMicLevel] = useState(0);       // live mic level 0..1 (meter)
+  const meterRef = useRef(null);                     // { ctx, raf } for teardown
   const [micReady, setMicReady] = useState(false);   // agent mic confirmed working
   const [micBlocked, setMicBlocked] = useState(false); // agent mic denied/unavailable
 
@@ -334,6 +336,7 @@ function App() {
                 console.log('Remote audio playing (reconnected)');
               }, session?.token);
               callRef.current = callTransports;
+              startMicMeter(callTransports?.localStream);
             } catch (err) {
               console.error('[agent] Failed to restore media:', err);
               endCall();
@@ -433,6 +436,41 @@ function App() {
     setSocket(s);
   };
 
+  // Live mic meter. A dead/silent mic is invisible otherwise — every server
+  // metric looks healthy while the customer hears nothing — so show the agent
+  // their own level and let them catch it in the first second of the call.
+  const startMicMeter = (stream) => {
+    stopMicMeter();
+    try {
+      if (!stream) return;
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        analyser.getByteTimeDomainData(data);
+        let peak = 0;
+        for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] - 128));
+        setMicLevel(Math.min(1, peak / 60)); // ~60 of 128 is a comfortable full scale
+        meterRef.current.raf = requestAnimationFrame(tick);
+      };
+      meterRef.current = { ctx, raf: requestAnimationFrame(tick) };
+    } catch (_) { }
+  };
+
+  const stopMicMeter = () => {
+    try {
+      if (meterRef.current?.raf) cancelAnimationFrame(meterRef.current.raf);
+      if (meterRef.current?.ctx) meterRef.current.ctx.close();
+    } catch (_) { }
+    meterRef.current = null;
+    setMicLevel(0);
+  };
+
   // Mute the agent's mic mid-call (background noise, a cough, a word with a
   // colleague). Instant both ways — the track stays produced, just silent.
   const toggleMute = () => {
@@ -441,6 +479,7 @@ function App() {
   };
 
   const handleCallCleanup = () => {
+    stopMicMeter();
     setIsMuted(false); // never carry a mute into the next call
     clearTimeout(ringTimeoutRef.current);
     if (callRef.current) {
@@ -478,6 +517,7 @@ function App() {
           console.log('Remote audio playing');
         }, session?.token);
         callRef.current = callTransports;
+        startMicMeter(callTransports?.localStream);
       } catch (err) {
         console.error('[agent] setupCall failed:', err);
         alert(`Call setup failed: ${err.message}`);
@@ -539,6 +579,7 @@ function App() {
             console.log('Remote audio playing');
           }, session?.token);
           callRef.current = callTransports;
+          startMicMeter(callTransports?.localStream);
         } catch (err) {
           console.error('[agent] setupCall failed:', err);
           alert(`Call setup failed: ${err.message}`);
@@ -861,6 +902,27 @@ function App() {
             </div>
           )}
           <div className="call-timer">{fmtTimer(callElapsed)}</div>
+
+          {/* Live mic meter — if this bar doesn't move while you talk, the
+              customer cannot hear you (dead mic / wrong input device). */}
+          {activeCall.state === 'Connected' && (
+            <div className="mic-meter-wrap">
+              <div className="mic-meter">
+                <div
+                  className="mic-meter-fill"
+                  style={{ width: `${Math.round((isMuted ? 0 : micLevel) * 100)}%` }}
+                />
+              </div>
+              <div className="mic-meter-label">
+                {isMuted
+                  ? 'Muted'
+                  : micLevel > 0.06
+                    ? '🎤 Your mic is working'
+                    : '🎤 Speak — no sound detected yet'}
+              </div>
+            </div>
+          )}
+
           <div className="call-actions">
             {activeCall.state === 'Connected' && (
               <button

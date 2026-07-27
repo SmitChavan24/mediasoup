@@ -251,10 +251,18 @@ export async function setupCall(socket, callId, onRemoteAudio, authToken) {
       throw new Error('No microphone found. Please connect a mic and try again.');
     }
 
+    // Let the BROWSER pick the system default mic. Forcing audioInputs[0] was
+    // the one-way-audio bug: the first enumerated device is often not the
+    // working one (a disconnected headset, "Stereo Mix", a virtual/OBS device),
+    // and those hand back a perfectly valid track that carries pure SILENCE —
+    // RTP flows, transports connect, every server metric looks healthy, and the
+    // customer hears nothing. The default device is the one the user actually
+    // chose in their OS.
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: audioInputs[0].deviceId ? { ideal: audioInputs[0].deviceId } : undefined }
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
     const track = stream.getAudioTracks()[0];
+    console.log('[mediasoup] 🎤 Using mic:', track.label || 'default');
     addTrackToRecording(track);
     await sendTransport.produce({ track });
   } catch (err) {
@@ -276,6 +284,10 @@ export async function setupCall(socket, callId, onRemoteAudio, authToken) {
   }
   return {
     sendTransport, recvTransport,
+    // The live mic stream, so the UI can show a level meter — the agent can
+    // SEE their voice registering instead of discovering a dead mic from a
+    // customer complaint after the call.
+    localStream: stream,
     // Mute/unmute the agent's mic mid-call. Toggling `enabled` keeps the
     // producer and RTP flow intact (just silent), so unmuting is instant —
     // unlike pausing/stopping the track, which needs a renegotiation. The
