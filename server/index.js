@@ -1718,6 +1718,23 @@ async function main() {
     });
 
     // ── HANGUP ────────────────────────────────────────────────────────────
+    // The client reports whether the remote audio ACTUALLY started playing.
+    // Media can look perfect server-side (ICE completed, producer score 10)
+    // while the listener hears nothing because the browser blocked playback —
+    // this is what makes that failure visible instead of silent.
+    socket.on('audioPlaybackStatus', (info = {}) => {
+      const who = socket.user?.username || socket.id;
+      const role = socket.user?.role || '?';
+      if (info.playing) {
+        console.log(`[audio] 🔊 ${role} ${who} is hearing the call (callId=${info.callId})`);
+      } else {
+        console.warn(
+          `[audio] 🔇 ${role} ${who} is NOT hearing audio (callId=${info.callId}) ` +
+          `paused=${info.paused} muted=${info.muted} volume=${info.volume} readyState=${info.readyState}`
+        );
+      }
+    });
+
     socket.on('hangup', async () => {
       console.log(`[hangup] 📱 Hangup requested by socket=${socket.id}`);
       await endCall(socket);
