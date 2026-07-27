@@ -83,6 +83,12 @@ const iceServers = (TURN_HOST && TURN_USERNAME && TURN_CREDENTIAL)
 // ── Transport factory (accepts the per-call router) ───────────────────────────
 async function createTransport(router) {
   const transport = await router.createWebRtcTransport(transportOptions);
+  // TEMP DIAGNOSTIC (one-way audio): show which path each transport actually
+  // uses (host/srflx vs relay) and whether ICE stays connected.
+  transport.on('icestatechange', (state) =>
+    console.log(`[ice] transport ${transport.id} state=${state}`));
+  transport.on('selectedtuplechange', (t) =>
+    console.log(`[ice] transport ${transport.id} SELECTED ${t?.protocol} local=${t?.localIp}:${t?.localPort} remote=${t?.remoteIp}:${t?.remotePort}`));
   return {
     transport,
     params: {

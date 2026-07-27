@@ -1192,6 +1192,7 @@ async function main() {
           callerRole: callerUser.role,
           calleeName: targetUsername || finalTargetUser?.username || null,
           calleeRole: targetRole || finalTargetUser?.role || null,
+          calleePwaId: targetDbId || null, // lets the agent re-dial from history
           callType: 'direct',
         });
       } catch (err) {
@@ -2062,10 +2063,10 @@ async function main() {
   });
 
   // Callback lookup for the agent panel. Agents do NOT get an open list — they
-  // must pass ?phone=<digits>, and only that number's open callbacks come back
-  // (server-enforced, so it's a rule not just a hidden UI). Without a phone the
-  // response is empty. The admin panel passes ?all=1 to still see the full
-  // queue for oversight.
+  // must pass ?phone=<digits>, which returns that number's callback if they've
+  // EVER requested one (any status, open preferred) so the agent can call any
+  // past requester. Without a phone the response is empty (server-enforced).
+  // The admin panel passes ?all=1 to see the full OPEN queue for oversight.
   app.get('/api/callbacks', authMiddleware, async (req, res) => {
     try {
       const status = ['pending', 'claimed', 'done', 'cancelled'].includes(req.query.status)
@@ -2079,15 +2080,27 @@ async function main() {
         return res.json({ success: true, count: 0, requests: [] });
       }
 
-      const statusClause = status ? 'status = ?' : "status IN ('pending','claimed')";
-      const params = status ? [status] : [];
-      let sql = `SELECT * FROM callback_requests WHERE ${statusClause}`;
+      let rows;
       if (phoneDigits) {
-        sql += ' AND RIGHT(REPLACE(phone," ",""),10) = ?';
-        params.push(phoneDigits);
+        // LIFETIME lookup: an agent can call anyone who has EVER requested a
+        // callback (any status), not just those with an open one. Prefer a
+        // still-open request; otherwise fall back to their most recent past one.
+        [rows] = await pool.execute(
+          `SELECT * FROM callback_requests
+             WHERE RIGHT(REPLACE(phone," ",""),10) = ?
+             ORDER BY (status IN ('pending','claimed')) DESC, requested_at DESC
+             LIMIT 1`,
+          [phoneDigits]
+        );
+      } else {
+        // Admin oversight (?all=1): the current open queue.
+        const statusClause = status ? 'status = ?' : "status IN ('pending','claimed')";
+        const params = status ? [status] : [];
+        [rows] = await pool.execute(
+          `SELECT * FROM callback_requests WHERE ${statusClause} ORDER BY requested_at ASC LIMIT 500`,
+          params
+        );
       }
-      sql += ' ORDER BY requested_at ASC LIMIT 500';
-      const [rows] = await pool.execute(sql, params);
 
       const online = onlineCustomerIds();
       res.json({

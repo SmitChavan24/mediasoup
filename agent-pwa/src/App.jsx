@@ -568,6 +568,15 @@ function App() {
     dialByUserId(cb.pwa_user_id, name);
   };
 
+  // Re-dial a customer from call history (not tied to a callback request).
+  const startCallById = async (pwaId, name) => {
+    if (!pwaId) return;
+    const ok = micReady || (await ensureMic());
+    if (!ok) return;
+    activeCallbackIdRef.current = null;
+    dialByUserId(pwaId, name);
+  };
+
   // Look a callback up by phone number. Agents have no open list — a request is
   // only visible once its number is searched (enforced server-side too).
   const searchByPhone = async (e) => {
@@ -673,6 +682,15 @@ function App() {
 
       {!activeCall ? (
         <>
+          <nav className="nav-tabs">
+            <button className={`nav-tab ${!showHistory ? 'active' : ''}`} onClick={() => setShowHistory(false)}>
+              🔍 Find Callback
+            </button>
+            <button className={`nav-tab ${showHistory ? 'active' : ''}`} onClick={() => setShowHistory(true)}>
+              📋 Call History
+            </button>
+          </nav>
+
           <div className="main-content">
             {/* ── Microphone blocked warning ────────────────────────── */}
             {micBlocked && (
@@ -702,22 +720,24 @@ function App() {
               </div>
             )}
 
-            {/* ── Look up a callback by number ──────────────────────── */}
-            <form onSubmit={searchByPhone} style={{ display: 'flex', gap: '8px', margin: '4px 4px 14px' }}>
-              <input
-                type="tel"
-                inputMode="numeric"
-                placeholder="Enter customer number"
-                value={searchPhone}
-                onChange={(e) => setSearchPhone(e.target.value)}
-                style={{ flex: 1, padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--border-color, #334155)', background: 'var(--bg, #0f172a)', color: 'var(--text-primary, #f8fafc)', fontSize: '14px', outline: 'none' }}
-              />
-              <button type="submit" className="call-btn" disabled={searching}>
-                {searching ? '…' : '🔍 Search'}
-              </button>
-            </form>
+            {/* ── Find a callback by number ─────────────────────────── */}
+            {!showHistory && (
+              <form onSubmit={searchByPhone} style={{ display: 'flex', gap: '8px', margin: '4px 4px 14px' }}>
+                <input
+                  type="tel"
+                  inputMode="numeric"
+                  placeholder="Enter customer number"
+                  value={searchPhone}
+                  onChange={(e) => setSearchPhone(e.target.value)}
+                  style={{ flex: 1, padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--border-color, #334155)', background: 'var(--bg, #0f172a)', color: 'var(--text-primary, #f8fafc)', fontSize: '14px', outline: 'none' }}
+                />
+                <button type="submit" className="call-btn" disabled={searching}>
+                  {searching ? '…' : '🔍 Search'}
+                </button>
+              </form>
+            )}
 
-            {!incomingCall && (
+            {!showHistory && !incomingCall && (
               !searched ? (
                 <div className="empty-state">
                   <div className="empty-icon">🔍</div>
@@ -756,6 +776,59 @@ function App() {
                     );
                   })}
                 </ul>
+              )
+            )}
+
+            {/* ── Call History — re-dial past customers (online = reachable) ── */}
+            {showHistory && !incomingCall && (
+              historyLoading ? (
+                <div className="empty-state"><div className="loading-spinner"></div></div>
+              ) : callHistory.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-icon">📋</div>
+                  <p>No calls yet.</p>
+                </div>
+              ) : (
+                <>
+                  <ul className="user-list">
+                    {callHistory.map((row) => {
+                      const name = row.callee_name || row.caller_name || '—';
+                      const pwaId = row.callee_pwa_id;
+                      const online = pwaId && activeCustomers.some((c) => String(c.userId) === String(pwaId));
+                      return (
+                        <li key={row.id} className="user-card">
+                          <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span className="user-name">{name}</span>
+                              {pwaId && <span className={`status-dot ${online ? 'online' : ''}`} title={online ? 'Online now' : 'Offline'}></span>}
+                              <StatusBadge status={row.status} />
+                            </div>
+                            <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
+                              {fmtDateTime(row.started_at)} · {fmtDuration(row.duration_sec)}
+                            </span>
+                          </div>
+                          {pwaId ? (
+                            <button
+                              className="call-btn"
+                              style={online ? undefined : { opacity: 0.7 }}
+                              onClick={() => startCallById(pwaId, name)}
+                              title={online ? 'Call now' : 'Customer offline — call may not ring'}
+                            >
+                              📞 Call
+                            </button>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {historyTotalPages > 1 && (
+                    <div className="pagination">
+                      <button disabled={historyPage <= 1} onClick={() => setHistoryPage((p) => p - 1)}>← Prev</button>
+                      <span className="page-info">Page {historyPage}/{historyTotalPages}</span>
+                      <button disabled={historyPage >= historyTotalPages} onClick={() => setHistoryPage((p) => p + 1)}>Next →</button>
+                    </div>
+                  )}
+                </>
               )
             )}
           </div>

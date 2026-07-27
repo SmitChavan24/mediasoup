@@ -38,14 +38,17 @@ async function insertCallRecord(data) {
 
     await pool.execute(
         `INSERT INTO call_history
-       (call_id, caller_id, caller_name, caller_role, callee_id, callee_name, callee_role, status, started_at, call_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'missed', NOW(), ?)`,
+       (call_id, caller_id, caller_name, caller_role, callee_id, callee_pwa_id, callee_name, callee_role, status, started_at, call_type)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'missed', NOW(), ?)`,
         [
             data.callId,
             callerId,
             data.callerName || null,
             data.callerRole || null,
             calleeId,
+            // The customer's PWA user id — they're not in the agent users table,
+            // so this is what lets an agent re-dial them from history.
+            data.calleePwaId || null,
             data.calleeName || null,
             data.calleeRole || null,
             data.callType || 'direct',
@@ -165,7 +168,7 @@ async function getCallHistory(filters = {}) {
 
     // Fetch page
     const [rows] = await pool.execute(
-        `SELECT id, call_id, caller_name, caller_role, callee_name, callee_role,
+        `SELECT id, call_id, caller_name, caller_role, callee_name, callee_role, callee_pwa_id,
             status, started_at, answered_at, ended_at, duration_sec, recording_path, call_type, ended_by, call_date
      FROM call_history ${whereClause}
      ORDER BY started_at DESC
