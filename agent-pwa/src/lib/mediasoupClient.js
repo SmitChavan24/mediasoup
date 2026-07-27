@@ -275,7 +275,21 @@ export async function setupCall(socket, callId, onRemoteAudio, authToken) {
     throw err;
   }
   return {
-    sendTransport, recvTransport, close: () => {
+    sendTransport, recvTransport,
+    // Mute/unmute the agent's mic mid-call. Toggling `enabled` keeps the
+    // producer and RTP flow intact (just silent), so unmuting is instant —
+    // unlike pausing/stopping the track, which needs a renegotiation. The
+    // recording still captures the (silent) local track, matching what the
+    // customer actually heard.
+    setMuted: (muted) => {
+      try {
+        stream?.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    close: () => {
       _currentCallId = null;
       stopRecordingAndUpload();
       audioElements.forEach(a => a.remove());

@@ -84,13 +84,16 @@ io.use(async (socket, next) => {
     if (socket.handshake.auth?.isPwaClient) {
       const { userId, username } = socket.handshake.auth;
       let finalUsername = username || 'Customer';
+      let finalPhone = null;
 
       if (userId && !userId.startsWith('guest_') && tgPool) {
         try {
-          // Get real name and phone from remote AWS DB (dbt_user)
-          const [tgRows] = await tgPool.query('SELECT COALESCE(CONCAT(first_name, " ", last_name), username, phone) as name FROM dbt_user WHERE user_id = ? LIMIT 1', [userId]);
-          if (tgRows && tgRows.length > 0 && tgRows[0].name) {
-            finalUsername = tgRows[0].name; // Use real name or fallback to phone
+          // Get real name and phone from remote AWS DB (dbt_user). The phone is
+          // carried onto the call record so agents see a number in history.
+          const [tgRows] = await tgPool.query('SELECT COALESCE(CONCAT(first_name, " ", last_name), username, phone) as name, phone FROM dbt_user WHERE user_id = ? LIMIT 1', [userId]);
+          if (tgRows && tgRows.length > 0) {
+            if (tgRows[0].name) finalUsername = tgRows[0].name; // real name or phone fallback
+            if (tgRows[0].phone) finalPhone = String(tgRows[0].phone);
           }
         } catch (err) {
           console.error('[auth] Failed to lookup PWA user in AWS DB:', err.message);
@@ -100,6 +103,7 @@ io.use(async (socket, next) => {
       socket.user = {
         userId: userId || `guest_${Date.now()}`,
         username: finalUsername,
+        phone: finalPhone,
         role: 'customer'
       };
       return next();
@@ -500,6 +504,54 @@ async function autoCloseCallbacksForUsers(userIds, callId) {
   }
 }
 
+// Last-resort phone lookup for a PWA user: their most recent callback request
+// carries the number they asked to be called on. Used when the customer is
+// offline (no live socket) so call history still records a number.
+async function phoneForPwaUser(pwaUserId) {
+  if (!pwaUserId) return null;
+  try {
+    const [rows] = await getPool().execute(
+      `SELECT phone FROM callback_requests WHERE pwa_user_id = ?
+        ORDER BY requested_at DESC LIMIT 1`,
+      [String(pwaUserId)]
+    );
+    return rows[0]?.phone || null;
+  } catch {
+    return null;
+  }
+}
+
+// An agent dialled but the customer never answered. Their callback request
+// stays OPEN (so it's still in the agent's search results for a retry) and we
+// push "we tried to reach you" so they can come back and be reachable —
+// otherwise a missed call is a silently lost lead.
+async function notifyMissedCall(parties, callId) {
+  try {
+    const customer = (parties || []).find((p) => p && p.role === 'customer');
+    if (!customer?.userId || String(customer.userId).startsWith('guest_')) return;
+
+    // Only bother if they actually have an open callback waiting.
+    const pool = getPool();
+    const [open] = await pool.execute(
+      `SELECT id FROM callback_requests
+        WHERE pwa_user_id = ? AND status IN ('pending','claimed') LIMIT 1`,
+      [String(customer.userId)]
+    );
+    if (!open.length) return;
+
+    const appUrl = process.env.PWA_APP_URL || 'https://lite.tglevels.in';
+    fetch(`${appUrl}/api/missed-call-push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.INTERNAL_API_KEY || '' },
+      body: JSON.stringify({ user_id: String(customer.userId) }),
+    }).catch((e) => console.warn('[missedCall] push failed:', e.message));
+
+    console.log(`[missedCall] 📭 ${customer.username} did not answer (callId=${callId}) — request kept open, push sent`);
+  } catch (e) {
+    console.error('[missedCall] failed:', e.message);
+  }
+}
+
 async function endCall(socket) {
   const user = await getUser(socket.id);
   if (!user || !user.callId) return;
@@ -568,9 +620,16 @@ async function endCall(socket) {
     await updateUser(otherSocketId, { callId: '' });
   }
 
-  // Clear the customer's callback request now that the call is over — from
-  // whichever side hung up. Fire-and-forget so it never delays teardown.
-  autoCloseCallbacksForUsers([user.userId, otherUser?.userId], callId);
+  // A callback request is only "handled" if the two sides actually spoke.
+  //   • connected → close it (it's done).
+  //   • never answered → KEEP IT OPEN so the agent can retry, and tell the
+  //     customer we tried. Previously every ended call closed the request, so
+  //     an unanswered callback silently vanished — a lost lead.
+  if (call.accepted === 'true') {
+    autoCloseCallbacksForUsers([user.userId, otherUser?.userId], callId);
+  } else {
+    notifyMissedCall([user, otherUser], callId);
+  }
 
   // Cleanup this socket
   closeLocalMediasoup(socket.id);
@@ -1193,6 +1252,12 @@ async function main() {
           calleeName: targetUsername || finalTargetUser?.username || null,
           calleeRole: targetRole || finalTargetUser?.role || null,
           calleePwaId: targetDbId || null, // lets the agent re-dial from history
+          // Phone from the customer's live socket, else the open callback row.
+          calleePhone:
+            targetSocket?.user?.phone ||
+            finalTargetUser?.phone ||
+            (await phoneForPwaUser(targetDbId)) ||
+            null,
           callType: 'direct',
         });
       } catch (err) {

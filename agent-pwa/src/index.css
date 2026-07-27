@@ -481,6 +481,33 @@ button.btn-decline:hover { background: #dc2626; }
 
 .hangup-btn:hover { background: #dc2626; }
 
+/* In-call actions (mute + hang up) */
+.call-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.mute-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  padding: 14px 28px;
+  font-size: 15px;
+  border-radius: 50px;
+  font-weight: 600;
+}
+
+.mute-btn:hover { background: rgba(255, 255, 255, 0.14); }
+
+.mute-btn.muted {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: var(--warning-color);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    CALL HISTORY
    ═══════════════════════════════════════════════════════════════════════════ */

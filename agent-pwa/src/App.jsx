@@ -84,6 +84,7 @@ function App() {
   const [searched, setSearched] = useState(false);
   const [searching, setSearching] = useState(false);
   const searchedPhoneRef = useRef(''); // last searched last-10-digits, for live updates
+  const [isMuted, setIsMuted] = useState(false);     // agent mic muted mid-call
   const [micReady, setMicReady] = useState(false);   // agent mic confirmed working
   const [micBlocked, setMicBlocked] = useState(false); // agent mic denied/unavailable
 
@@ -432,7 +433,15 @@ function App() {
     setSocket(s);
   };
 
+  // Mute the agent's mic mid-call (background noise, a cough, a word with a
+  // colleague). Instant both ways — the track stays produced, just silent.
+  const toggleMute = () => {
+    const next = !isMuted;
+    if (callRef.current?.setMuted?.(next) !== false) setIsMuted(next);
+  };
+
   const handleCallCleanup = () => {
+    setIsMuted(false); // never carry a mute into the next call
     clearTimeout(ringTimeoutRef.current);
     if (callRef.current) {
       callRef.current.close();
@@ -803,6 +812,11 @@ function App() {
                               {pwaId && <span className={`status-dot ${online ? 'online' : ''}`} title={online ? 'Online now' : 'Offline'}></span>}
                               <StatusBadge status={row.status} />
                             </div>
+                            {row.callee_phone && (
+                              <span style={{ fontSize: '12px', color: 'var(--text-primary)', fontWeight: 600, letterSpacing: '0.02em' }}>
+                                {row.callee_phone}
+                              </span>
+                            )}
                             <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
                               {fmtDateTime(row.started_at)} · {fmtDuration(row.duration_sec)}
                             </span>
@@ -847,7 +861,23 @@ function App() {
             </div>
           )}
           <div className="call-timer">{fmtTimer(callElapsed)}</div>
-          <button className="hangup-btn" onClick={endCall}>End Call</button>
+          <div className="call-actions">
+            {activeCall.state === 'Connected' && (
+              <button
+                className={`mute-btn ${isMuted ? 'muted' : ''}`}
+                onClick={toggleMute}
+                title={isMuted ? 'Unmute your microphone' : 'Mute your microphone'}
+              >
+                {isMuted ? '🔇 Unmute' : '🎙️ Mute'}
+              </button>
+            )}
+            <button className="hangup-btn" onClick={endCall}>End Call</button>
+          </div>
+          {isMuted && (
+            <div className="call-warning" style={{ marginTop: '12px' }}>
+              🔇 You are muted — the customer can't hear you
+            </div>
+          )}
         </div>
       )}
     </div>
