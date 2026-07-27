@@ -190,6 +190,38 @@ function App() {
     }
   };
 
+  // Admin self-registration (open) — signs up a new admin and logs them in.
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    if (formPassword !== formConfirmPassword) {
+      setAuthError('Passwords do not match.');
+      return;
+    }
+    setAuthLoading(true);
+    try {
+      const res = await fetch(`${SERVER_URL}/api/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: formUsername.trim(),
+          phone: formPhone.trim(),
+          password: formPassword,
+          role: 'admin',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Registration failed');
+      const sess = { token: data.token, username: data.username, phone: data.phone, role: data.role };
+      storeSession(sess);
+      setSession(sess);
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
   // Admin creates an agent (authenticated with the admin's token). Does NOT
   // switch the session — the admin stays logged in; the new agent then logs in
   // on the agent panel with these credentials.
@@ -400,29 +432,35 @@ function App() {
           <h2>Admin Dashboard</h2>
           <p>Sign in with your phone number</p>
 
+          <div className="auth-tabs">
+            <button
+              className={`auth-tab ${authMode === 'login' ? 'active' : ''}`}
+              onClick={() => { setAuthMode('login'); setAuthError(''); }}
+            >Login</button>
+            <button
+              className={`auth-tab ${authMode === 'register' ? 'active' : ''}`}
+              onClick={() => { setAuthMode('register'); setAuthError(''); }}
+            >Register</button>
+          </div>
+
           {authError && <div className="auth-error">{authError}</div>}
 
-          {/* Login only — no self-registration. */}
-          <form onSubmit={handleLogin}>
-            <input
-              type="tel"
-              placeholder="Phone Number"
-              value={formPhone}
-              onChange={e => setFormPhone(e.target.value)}
-              autoFocus
-              required
-            />
-            <input
-              type="password"
-              placeholder="Password"
-              value={formPassword}
-              onChange={e => setFormPassword(e.target.value)}
-              required
-            />
-            <button type="submit" disabled={authLoading}>
-              {authLoading ? 'Signing in...' : 'Sign In'}
-            </button>
-          </form>
+          {authMode === 'login' ? (
+            <form onSubmit={handleLogin}>
+              <input type="tel" placeholder="Phone Number" value={formPhone} onChange={e => setFormPhone(e.target.value)} autoFocus required />
+              <input type="password" placeholder="Password" value={formPassword} onChange={e => setFormPassword(e.target.value)} required />
+              <button type="submit" disabled={authLoading}>{authLoading ? 'Signing in...' : 'Sign In'}</button>
+            </form>
+          ) : (
+            /* Admin self-registration */
+            <form onSubmit={handleRegister}>
+              <input type="text" placeholder="Name" value={formUsername} onChange={e => setFormUsername(e.target.value)} autoFocus required />
+              <input type="tel" placeholder="Phone Number" value={formPhone} onChange={e => setFormPhone(e.target.value)} required />
+              <input type="password" placeholder="Password (min 6 chars)" value={formPassword} onChange={e => setFormPassword(e.target.value)} required minLength={6} />
+              <input type="password" placeholder="Confirm Password" value={formConfirmPassword} onChange={e => setFormConfirmPassword(e.target.value)} required />
+              <button type="submit" disabled={authLoading}>{authLoading ? 'Creating Account...' : 'Create Admin Account'}</button>
+            </form>
+          )}
         </div>
       </div>
     );
