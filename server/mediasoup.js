@@ -43,6 +43,31 @@ async function spawnWorker(index) {
     workers[index] = await spawnWorker(index);
   });
   const router = await worker.createRouter({ mediaCodecs });
+
+  // TEMP DIAGNOSTIC (one-way audio): report which producers actually carry
+  // SOUND. Producer/consumer scores only prove RTP is flowing — a muted or
+  // dead mic still sends packets (silence), which looks identical in the logs.
+  // This is the only signal that distinguishes "audio is flowing" from
+  // "someone is actually speaking".
+  try {
+    const observer = await router.createAudioLevelObserver({
+      maxEntries: 4,
+      threshold: -70,     // dBov; -70 is quiet-but-real speech
+      interval: 1000,
+    });
+    router._tgAudioObserver = observer;
+    observer.on('volumes', (volumes) => {
+      for (const { producer, volume } of volumes) {
+        console.log(`[audiolevel] 🎚️  producer=${producer.id} volume=${volume}dBov (SOUND detected)`);
+      }
+    });
+    observer.on('silence', () => {
+      console.log('[audiolevel] 🤫 silence — no producer above threshold');
+    });
+  } catch (e) {
+    console.warn('[mediasoup] audioLevelObserver unavailable:', e.message);
+  }
+
   console.log(`[mediasoup] Worker[${index}] (pid ${worker.pid}) ready`);
   return { worker, router };
 }

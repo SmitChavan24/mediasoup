@@ -1017,7 +1017,21 @@ async function main() {
 
         const producer = await sendTransport.produce({ kind, rtpParameters });
         localProducers[socket.id] = producer;
-        console.log(`[produce] ✅ Producer created: id=${producer.id} kind=${producer.kind} paused=${producer.paused}`);
+        const who = socket.user?.username || socket.id;
+        const whoRole = socket.user?.role || '?';
+        console.log(`[produce] ✅ Producer created: id=${producer.id} kind=${producer.kind} paused=${producer.paused} by=${whoRole} ${who}`);
+
+        // Watch this producer's actual audio level, so we can tell a live mic
+        // from one that's sending silence (muted / wrong device / dead).
+        try {
+          const r = (callId && callRouters[callId]) || getAnyRouter();
+          if (r?._tgAudioObserver && kind === 'audio') {
+            await r._tgAudioObserver.addProducer({ producerId: producer.id });
+            console.log(`[audiolevel] 👂 watching producer=${producer.id} (${whoRole} ${who})`);
+          }
+        } catch (e) {
+          console.warn('[audiolevel] addProducer failed:', e.message);
+        }
 
         // Log producer lifecycle events
         producer.on('transportclose', () => {
