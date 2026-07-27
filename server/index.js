@@ -1198,6 +1198,19 @@ async function main() {
         console.error(`[dialOut] ❌ Failed to insert call history:`, err);
       }
 
+      // Backgrounded/offline PWA customer → web-push a buzzing incoming-call
+      // banner via the app box (PWA_NOTIFY holds the subscriptions + VAPID).
+      // Reliable path from the media box; fire-and-forget so it never delays
+      // the call setup.
+      if (!targetSocket && targetDbId) {
+        const appUrl = process.env.PWA_APP_URL || 'https://lite.tglevels.in';
+        fetch(`${appUrl}/api/incoming-call-push`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.INTERNAL_API_KEY || '' },
+          body: JSON.stringify({ user_id: String(targetDbId), caller: 'TG Levels Support' }),
+        }).catch((e) => console.warn('[dialOut] incoming-call-push failed:', e.message));
+      }
+
       // ── Dispatch Incoming Call (Socket or Web Push) ────────────────────
       if (targetSocket) {
         // Target is online via WebSocket
