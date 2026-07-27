@@ -97,6 +97,7 @@ function App() {
   const previousSocketId = useRef(null);
   const socketRef = useRef(null);
   const dialingRef = useRef(false);
+  const activeCallbackIdRef = useRef(null); // callback being handled by the current call
 
   // Incoming call ringtone
   useEffect(() => {
@@ -424,6 +425,12 @@ function App() {
       callRef.current.close();
       callRef.current = null;
     }
+    // The call for a callback just ended — close that request so it clears from
+    // every panel automatically (no manual "Done").
+    if (activeCallbackIdRef.current) {
+      closeCallback(activeCallbackIdRef.current);
+      activeCallbackIdRef.current = null;
+    }
     clearCurrentCallId();
     setActiveCall(null);
     setIncomingCall(null);
@@ -474,6 +481,9 @@ function App() {
     socket.emit('dialOut', payload, (res) => {
       dialingRef.current = false;
       if (res.error) {
+        // Dial never connected — keep the callback in the queue (don't let the
+        // cleanup below close it) so the agent can retry.
+        activeCallbackIdRef.current = null;
         if (res.busy) {
           setActiveCall({ withUser: customerName, state: 'On Another Call' });
           setTimeout(() => handleCallCleanup(), 3000);
@@ -638,7 +648,7 @@ function App() {
           {/* ── Nav Tabs ──────────────────────────────────────────────── */}
           <nav className="nav-tabs">
             <button className={`nav-tab ${!showHistory ? 'active' : ''}`} onClick={() => setShowHistory(false)}>
-              👥 Customers ({activeCustomers.length})
+              📞 Callbacks ({callbacks.length})
             </button>
             <button className={`nav-tab ${showHistory ? 'active' : ''}`} onClick={() => setShowHistory(true)}>
               📋 Call History
@@ -663,73 +673,37 @@ function App() {
             {/* ── Customers Tab ─────────────────────────────────────── */}
             {!showHistory ? (
               <>
-                {/* ── Callback Requests queue (live via socket + fetch) ─── */}
-                {callbacks.length > 0 && (
-                  <div style={{ marginBottom: '16px' }}>
-                    <div style={{ fontSize: '13px', fontWeight: 700, color: 'var(--text-secondary)', margin: '4px 4px 8px' }}>
-                      📞 Callback Requests ({callbacks.length})
-                    </div>
-                    <ul className="user-list">
-                      {callbacks.map((cb) => {
-                        const name = cb.name && cb.name !== 'USER' && !/^pwaguest/i.test(cb.name) ? cb.name : (cb.phone || 'Customer');
-                        const isOnline = !!cb.online;
-                        return (
-                          <li key={cb.id} className="user-card" style={{ borderLeft: '3px solid #1E9B22' }}>
-                            <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                <span className="user-name">{name}</span>
-                                <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
-                                {cb.status === 'claimed' && <span className="user-role-tag" style={{ marginLeft: 0 }}>Claimed</span>}
-                              </div>
-                              <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
-                                {cb.phone} · {fmtDateTime(cb.requested_at)}
-                              </span>
-                            </div>
-                            <div style={{ display: 'flex', gap: '6px' }}>
-                              <button className="call-btn" onClick={() => dialByUserId(cb.pwa_user_id, name)}>📞 Call</button>
-                              <button className="logout-btn" style={{ padding: '6px 10px' }} onClick={() => closeCallback(cb.id)}>Done</button>
-                            </div>
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  </div>
-                )}
-
-                {activeCustomers.length === 0 ? (
+                {/* Callback requests only — nothing else (no online-users list). */}
+                {callbacks.length === 0 ? (
                   <div className="empty-state">
-                    <div className="empty-icon">👥</div>
-                    <p>No customers online.</p>
+                    <div className="empty-icon">📞</div>
+                    <p>No callback requests.</p>
                   </div>
                 ) : incomingCall ? null : (
                   <ul className="user-list">
-                    {activeCustomers.map(customer => {
-                      const onCall = !!customer.onCall;
-                      const withAgent = customer.withAgent;
+                    {callbacks.map((cb) => {
+                      const name = cb.name && cb.name !== 'USER' && !/^pwaguest/i.test(cb.name)
+                        ? cb.name : (cb.phone || 'Customer');
+                      const isOnline = !!cb.online;
                       return (
-                        <li key={customer.id} className="user-card">
+                        <li key={cb.id} className="user-card" style={{ borderLeft: '3px solid #1E9B22' }}>
                           <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <span className="user-name">{customer.username}</span>
-                              <span className={`status-dot ${onCall ? 'busy' : 'online'}`} title={onCall ? 'On call' : 'Online'}></span>
-                              <span className="user-role-tag" style={{ marginLeft: 0 }}>{onCall ? 'On call' : 'Online'}</span>
+                              <span className="user-name">{name}</span>
+                              <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
+                              {cb.status === 'claimed' && <span className="user-role-tag" style={{ marginLeft: 0 }}>Claimed</span>}
                             </div>
-                            {onCall && (
-                              <span style={{ fontSize: '11px', color: 'var(--warning, #fbbf24)', fontWeight: 600 }}>
-                                📞 On call with {withAgent || 'an agent'}
-                              </span>
-                            )}
+                            <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
+                              {cb.phone} · {fmtDateTime(cb.requested_at)}
+                            </span>
                           </div>
-                          {onCall ? (
-                            <span style={{ fontSize: '12px', color: 'var(--text-secondary)', opacity: 0.7 }}>Busy</span>
-                          ) : (
-                            <button
-                              className="call-btn"
-                              onClick={() => dialCustomer(customer.id, customer.username)}
-                            >
-                              📞 Call
-                            </button>
-                          )}
+                          {/* No "Done" — the request auto-clears when the call ends. */}
+                          <button
+                            className="call-btn"
+                            onClick={() => { activeCallbackIdRef.current = cb.id; dialByUserId(cb.pwa_user_id, name); }}
+                          >
+                            📞 Call
+                          </button>
                         </li>
                       );
                     })}
