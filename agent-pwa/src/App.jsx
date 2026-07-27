@@ -79,7 +79,11 @@ function App() {
   const [reconnecting, setReconnecting] = useState(false);
   const [peerDisconnected, setPeerDisconnected] = useState(null);
   const [activeCustomers, setActiveCustomers] = useState([]);
-  const [callbacks, setCallbacks] = useState([]); // pending/claimed callback requests
+  const [callbacks, setCallbacks] = useState([]); // search results for the entered number
+  const [searchPhone, setSearchPhone] = useState('');
+  const [searched, setSearched] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const searchedPhoneRef = useRef(''); // last searched last-10-digits, for live updates
 
 
   // Call history state
@@ -336,13 +340,7 @@ function App() {
       previousSocketId.current = s.id;
       setConnected(true);
       s.emit('getPresence');
-
-      // Load the callback queue on every (re)connect so a closed laptop never
-      // loses requests that arrived while it was away.
-      fetch(`${SERVER_URL}/api/callbacks`, { headers: { Authorization: `Bearer ${session?.token}` } })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((d) => { if (d?.requests) setCallbacks(d.requests); })
-        .catch(() => {});
+      // No open queue: agents look a callback up by number (searchByPhone).
     });
 
     s.on('connect_error', (err) => {
@@ -364,11 +362,15 @@ function App() {
       setActiveCustomers(customers);
     });
 
-    // A customer just asked for a callback — surfaces here and on admin at once.
+    // Live updates only apply to the number the agent is currently viewing.
+    const matchesSearch = (row) =>
+      searchedPhoneRef.current &&
+      String(row.phone || '').replace(/\D/g, '').slice(-10) === searchedPhoneRef.current;
+
     s.on('callbackRequested', (row) => {
+      if (!matchesSearch(row)) return;
       setCallbacks((prev) => (prev.some((c) => c.id === row.id) ? prev : [{ ...row, online: true }, ...prev]));
     });
-    // Claimed / released / closed by any agent — keep every panel in sync.
     s.on('callbacksUpdated', (row) => {
       setCallbacks((prev) =>
         ['done', 'cancelled'].includes(row.status)
@@ -531,6 +533,31 @@ function App() {
   const dialCustomer = (customerSocketId, customerName) => beginDial({ targetId: customerSocketId }, customerName);
   const dialByUserId = (userId, customerName) => beginDial({ targetUserId: userId }, customerName);
 
+  // Look a callback up by phone number. Agents have no open list — a request is
+  // only visible once its number is searched (enforced server-side too).
+  const searchByPhone = async (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    const digits = searchPhone.replace(/\D/g, '').slice(-10);
+    searchedPhoneRef.current = digits.length === 10 ? digits : '';
+    if (digits.length !== 10) {
+      setCallbacks([]);
+      setSearched(true);
+      return;
+    }
+    setSearching(true);
+    try {
+      const res = await fetch(`${SERVER_URL}/api/callbacks?phone=${digits}`, {
+        headers: { Authorization: `Bearer ${session?.token}` },
+      });
+      const d = res.ok ? await res.json() : null;
+      setCallbacks(d?.requests || []);
+    } catch {
+      setCallbacks([]);
+    }
+    setSearched(true);
+    setSearching(false);
+  };
+
   // Mark a callback handled — removes it from every panel's queue.
   const closeCallback = async (id) => {
     try {
@@ -659,16 +686,6 @@ function App() {
 
       {!activeCall ? (
         <>
-          {/* ── Nav Tabs ──────────────────────────────────────────────── */}
-          <nav className="nav-tabs">
-            <button className={`nav-tab ${!showHistory ? 'active' : ''}`} onClick={() => setShowHistory(false)}>
-              📞 Callbacks ({callbacks.length})
-            </button>
-            <button className={`nav-tab ${showHistory ? 'active' : ''}`} onClick={() => setShowHistory(true)}>
-              📋 Call History
-            </button>
-          </nav>
-
           <div className="main-content">
             {/* ── Incoming Call Banner ──────────────────────────────── */}
             {incomingCall && (
@@ -684,81 +701,61 @@ function App() {
               </div>
             )}
 
-            {/* ── Customers Tab ─────────────────────────────────────── */}
-            {!showHistory ? (
-              <>
-                {/* Callback requests only — nothing else (no online-users list). */}
-                {callbacks.length === 0 ? (
-                  <div className="empty-state">
-                    <div className="empty-icon">📞</div>
-                    <p>No callback requests.</p>
-                  </div>
-                ) : incomingCall ? null : (
-                  <ul className="user-list">
-                    {callbacks.map((cb) => {
-                      const name = cb.name && cb.name !== 'USER' && !/^pwaguest/i.test(cb.name)
-                        ? cb.name : (cb.phone || 'Customer');
-                      const isOnline = !!cb.online;
-                      return (
-                        <li key={cb.id} className="user-card" style={{ borderLeft: '3px solid #1E9B22' }}>
-                          <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <span className="user-name">{name}</span>
-                              <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
-                              {cb.status === 'claimed' && <span className="user-role-tag" style={{ marginLeft: 0 }}>Claimed</span>}
-                            </div>
-                            <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
-                              {cb.phone} · {fmtDateTime(cb.requested_at)}
-                            </span>
+            {/* ── Look up a callback by number ──────────────────────── */}
+            <form onSubmit={searchByPhone} style={{ display: 'flex', gap: '8px', margin: '4px 4px 14px' }}>
+              <input
+                type="tel"
+                inputMode="numeric"
+                placeholder="Enter customer number"
+                value={searchPhone}
+                onChange={(e) => setSearchPhone(e.target.value)}
+                style={{ flex: 1, padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--border-color, #334155)', background: 'var(--bg, #0f172a)', color: 'var(--text-primary, #f8fafc)', fontSize: '14px', outline: 'none' }}
+              />
+              <button type="submit" className="call-btn" disabled={searching}>
+                {searching ? '…' : '🔍 Search'}
+              </button>
+            </form>
+
+            {!incomingCall && (
+              !searched ? (
+                <div className="empty-state">
+                  <div className="empty-icon">🔍</div>
+                  <p>Enter a customer's number to find their callback.</p>
+                </div>
+              ) : callbacks.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-icon">📞</div>
+                  <p>No callback request for this number.</p>
+                </div>
+              ) : (
+                <ul className="user-list">
+                  {callbacks.map((cb) => {
+                    const name = cb.name && cb.name !== 'USER' && !/^pwaguest/i.test(cb.name)
+                      ? cb.name : (cb.phone || 'Customer');
+                    const isOnline = !!cb.online;
+                    return (
+                      <li key={cb.id} className="user-card" style={{ borderLeft: '3px solid #1E9B22' }}>
+                        <div className="user-info" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '2px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <span className="user-name">{name}</span>
+                            <span className={`status-dot ${isOnline ? 'online' : ''}`} title={isOnline ? 'Online' : 'Offline'}></span>
                           </div>
-                          {/* No "Done" — the request auto-clears when the call ends. */}
-                          <button
-                            className="call-btn"
-                            onClick={() => { activeCallbackIdRef.current = cb.id; dialByUserId(cb.pwa_user_id, name); }}
-                          >
-                            📞 Call
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-              </>
-            ) : (
-              /* ── History Tab ───────────────────────────────────────── */
-              <>
-                <div className="section-title">My Call History</div>
-                {historyLoading ? (
-                  <div className="empty-state"><div className="loading-spinner"></div></div>
-                ) : callHistory.length === 0 ? (
-                  <div className="empty-state">
-                    <div className="empty-icon">📋</div>
-                    <p>No calls yet.</p>
-                  </div>
-                ) : (
-                  <ul className="history-list">
-                    {callHistory.map(row => (
-                      <li key={row.id} className="history-item">
-                        <div className="history-item-main">
-                          <span className="history-peer">{row.caller_name === session.username ? (row.callee_name || '—') : (row.caller_name || '—')}</span>
-                          <StatusBadge status={row.status} />
+                          <span style={{ fontSize: '11px', color: 'var(--text-secondary)', opacity: 0.8 }}>
+                            {cb.phone} · {fmtDateTime(cb.requested_at)}
+                          </span>
                         </div>
-                        <div className="history-item-meta">
-                          <span>📅 {fmtDateTime(row.started_at)}</span>
-                          <span>⏱️ {fmtDuration(row.duration_sec)}</span>
-                        </div>
+                        {/* No "Done" — the request auto-clears when the call ends. */}
+                        <button
+                          className="call-btn"
+                          onClick={() => { activeCallbackIdRef.current = cb.id; dialByUserId(cb.pwa_user_id, name); }}
+                        >
+                          📞 Call
+                        </button>
                       </li>
-                    ))}
-                  </ul>
-                )}
-                {historyTotalPages > 1 && (
-                  <div className="pagination">
-                    <button disabled={historyPage <= 1} onClick={() => setHistoryPage(p => p - 1)}>← Prev</button>
-                    <span className="page-info">Page {historyPage}/{historyTotalPages}</span>
-                    <button disabled={historyPage >= historyTotalPages} onClick={() => setHistoryPage(p => p + 1)}>Next →</button>
-                  </div>
-                )}
-              </>
+                    );
+                  })}
+                </ul>
+              )
             )}
           </div>
         </>

@@ -2032,20 +2032,33 @@ async function main() {
     }
   });
 
-  // Queue for the agent and admin panels. Online state is resolved from live
-  // presence, so an agent can see who is reachable in the app right now.
+  // Callback lookup for the agent panel. Agents do NOT get an open list — they
+  // must pass ?phone=<digits>, and only that number's open callbacks come back
+  // (server-enforced, so it's a rule not just a hidden UI). Without a phone the
+  // response is empty. The admin panel passes ?all=1 to still see the full
+  // queue for oversight.
   app.get('/api/callbacks', authMiddleware, async (req, res) => {
     try {
       const status = ['pending', 'claimed', 'done', 'cancelled'].includes(req.query.status)
         ? req.query.status : null;
+      const phoneDigits = String(req.query.phone || '').replace(/\D/g, '').slice(-10);
+      const wantAll = req.query.all === '1' || req.query.all === 'true';
       const pool = getPool();
-      const [rows] = status
-        ? await pool.execute(
-            `SELECT * FROM callback_requests WHERE status = ?
-              ORDER BY requested_at ASC LIMIT 500`, [status])
-        : await pool.execute(
-            `SELECT * FROM callback_requests WHERE status IN ('pending','claimed')
-              ORDER BY requested_at ASC LIMIT 500`);
+
+      // Agents must search by phone; no phone + not admin-all → return nothing.
+      if (!phoneDigits && !wantAll) {
+        return res.json({ success: true, count: 0, requests: [] });
+      }
+
+      const statusClause = status ? 'status = ?' : "status IN ('pending','claimed')";
+      const params = status ? [status] : [];
+      let sql = `SELECT * FROM callback_requests WHERE ${statusClause}`;
+      if (phoneDigits) {
+        sql += ' AND RIGHT(REPLACE(phone," ",""),10) = ?';
+        params.push(phoneDigits);
+      }
+      sql += ' ORDER BY requested_at ASC LIMIT 500';
+      const [rows] = await pool.execute(sql, params);
 
       const online = onlineCustomerIds();
       res.json({

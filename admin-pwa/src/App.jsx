@@ -276,7 +276,7 @@ function App() {
       setConnected(true);
       refreshCalls(s);
       // Load the callback queue (also arrives live via socket below)
-      fetch(`${SERVER_URL}/api/callbacks`, { headers: { Authorization: `Bearer ${session?.token}` } })
+      fetch(`${SERVER_URL}/api/callbacks?all=1`, { headers: { Authorization: `Bearer ${session?.token}` } })
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => { if (d?.requests) setCallbacks(d.requests); })
         .catch(() => {});
