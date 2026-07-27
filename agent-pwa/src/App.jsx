@@ -98,6 +98,7 @@ function App() {
   const socketRef = useRef(null);
   const dialingRef = useRef(false);
   const activeCallbackIdRef = useRef(null); // callback being handled by the current call
+  const ringTimeoutRef = useRef(null); // safety: never hang on "Calling..." forever
 
   // Incoming call ringtone
   useEffect(() => {
@@ -421,6 +422,7 @@ function App() {
   };
 
   const handleCallCleanup = () => {
+    clearTimeout(ringTimeoutRef.current);
     if (callRef.current) {
       callRef.current.close();
       callRef.current = null;
@@ -495,7 +497,19 @@ function App() {
       const { callId } = res;
       setActiveCall({ callId, withUser: customerName, state: 'Calling...' });
 
+      // Safety net: if the customer never answers (or the answer/end event is
+      // lost to a socket reconnect), don't sit on "Calling..." forever — hang
+      // up and clean up after 45s.
+      clearTimeout(ringTimeoutRef.current);
+      ringTimeoutRef.current = setTimeout(() => {
+        if (!callRef.current) { // never reached "Connected" media
+          try { socket.emit('hangup'); } catch (_) {}
+          handleCallCleanup();
+        }
+      }, 45000);
+
       socket.once('callAccepted', async () => {
+        clearTimeout(ringTimeoutRef.current);
         setActiveCall({ callId, withUser: customerName, state: 'Connected' });
         try {
           // Pass the agent's token so the recording upload is authenticated —

@@ -468,6 +468,38 @@ async function processQueue() {
  * endCall — called on explicit hangup.  Cleans up both parties immediately
  * (no grace period since this is an intentional hangup).
  */
+// Close any open callback requests for these PWA user ids and tell both panels
+// to drop them. Called when a call ends so a callback clears the moment its
+// call is over — no manual "Done", and it works no matter who hung up. Agent
+// ids never match a callback row, so passing them is a harmless no-op.
+async function autoCloseCallbacksForUsers(userIds, callId) {
+  const ids = [...new Set((userIds || []).map((u) => u && String(u)).filter(Boolean))];
+  if (!ids.length) return;
+  try {
+    const pool = getPool();
+    for (const uid of ids) {
+      const [open] = await pool.execute(
+        `SELECT id FROM callback_requests WHERE pwa_user_id=? AND status IN ('pending','claimed')`,
+        [uid]
+      );
+      for (const r of open) {
+        await pool.execute(
+          `UPDATE callback_requests SET status='done', closed_at=NOW(), last_call_id=?
+             WHERE id=? AND status IN ('pending','claimed')`,
+          [String(callId || '').slice(0, 64) || null, r.id]
+        );
+        const [rows] = await pool.execute('SELECT * FROM callback_requests WHERE id=?', [r.id]);
+        if (rows[0]) {
+          io.to('agents').emit('callbacksUpdated', rows[0]);
+          io.to('admins').emit('callbacksUpdated', rows[0]);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[callback] auto-close on call end failed:', e.message);
+  }
+}
+
 async function endCall(socket) {
   const user = await getUser(socket.id);
   if (!user || !user.callId) return;
@@ -526,6 +558,7 @@ async function endCall(socket) {
     : call.agentSocketId;
 
   // Notify + cleanup other party
+  const otherUser = otherSocketId ? await getUser(otherSocketId) : null;
   if (otherSocketId) {
     const otherSocket = io.sockets.sockets.get(otherSocketId);
     if (otherSocket) {
@@ -534,6 +567,10 @@ async function endCall(socket) {
     closeLocalMediasoup(otherSocketId);
     await updateUser(otherSocketId, { callId: '' });
   }
+
+  // Clear the customer's callback request now that the call is over — from
+  // whichever side hung up. Fire-and-forget so it never delays teardown.
+  autoCloseCallbacksForUsers([user.userId, otherUser?.userId], callId);
 
   // Cleanup this socket
   closeLocalMediasoup(socket.id);
