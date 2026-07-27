@@ -84,6 +84,8 @@ function App() {
   const [searched, setSearched] = useState(false);
   const [searching, setSearching] = useState(false);
   const searchedPhoneRef = useRef(''); // last searched last-10-digits, for live updates
+  const [micReady, setMicReady] = useState(false);   // agent mic confirmed working
+  const [micBlocked, setMicBlocked] = useState(false); // agent mic denied/unavailable
 
 
   // Call history state
@@ -103,6 +105,13 @@ function App() {
   const dialingRef = useRef(false);
   const activeCallbackIdRef = useRef(null); // callback being handled by the current call
   const ringTimeoutRef = useRef(null); // safety: never hang on "Calling..." forever
+
+  // Confirm the mic works as soon as the agent is logged in, so a blocked mic
+  // is surfaced before any call (not discovered mid-call as silence).
+  useEffect(() => {
+    if (session) ensureMic();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
 
   // Incoming call ringtone
   useEffect(() => {
@@ -533,6 +542,32 @@ function App() {
   const dialCustomer = (customerSocketId, customerName) => beginDial({ targetId: customerSocketId }, customerName);
   const dialByUserId = (userId, customerName) => beginDial({ targetUserId: userId }, customerName);
 
+  // Confirm the agent's microphone actually works. Without it, a call still
+  // "connects" but the agent sends no audio — the customer hears silence (the
+  // one-way bug we saw). We check up front and block dialing until it's fixed.
+  const ensureMic = async () => {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach((t) => t.stop());
+      setMicReady(true);
+      setMicBlocked(false);
+      return true;
+    } catch {
+      setMicReady(false);
+      setMicBlocked(true);
+      return false;
+    }
+  };
+
+  // Mic-guarded call start: never dial (so we never go silently one-way) unless
+  // the agent's mic is confirmed working.
+  const startCall = async (cb, name) => {
+    const ok = micReady || (await ensureMic());
+    if (!ok) return; // banner already shown; agent must enable the mic
+    activeCallbackIdRef.current = cb.id;
+    dialByUserId(cb.pwa_user_id, name);
+  };
+
   // Look a callback up by phone number. Agents have no open list — a request is
   // only visible once its number is searched (enforced server-side too).
   const searchByPhone = async (e) => {
@@ -639,6 +674,20 @@ function App() {
       {!activeCall ? (
         <>
           <div className="main-content">
+            {/* ── Microphone blocked warning ────────────────────────── */}
+            {micBlocked && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', background: '#7f1d1d', color: '#fff', borderRadius: '10px', padding: '10px 14px', margin: '0 0 14px', fontSize: '13px' }}>
+                <span>🎙️ Your microphone is blocked — customers won't hear you. Allow mic access to make calls.</span>
+                <button
+                  className="call-btn"
+                  style={{ marginLeft: 'auto', background: '#fff', color: '#7f1d1d' }}
+                  onClick={ensureMic}
+                >
+                  Enable microphone
+                </button>
+              </div>
+            )}
+
             {/* ── Incoming Call Banner ──────────────────────────────── */}
             {incomingCall && (
               <div className="incoming-banner">
@@ -699,7 +748,7 @@ function App() {
                         {/* No "Done" — the request auto-clears when the call ends. */}
                         <button
                           className="call-btn"
-                          onClick={() => { activeCallbackIdRef.current = cb.id; dialByUserId(cb.pwa_user_id, name); }}
+                          onClick={() => startCall(cb, name)}
                         >
                           📞 Call
                         </button>
