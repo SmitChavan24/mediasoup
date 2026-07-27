@@ -1763,11 +1763,13 @@ async function main() {
 
   app.post('/api/login', async (req, res) => {
     try {
-      const { phone, password } = req.body;
-      if (!phone || !password) {
-        return res.status(400).json({ error: 'Phone and password are required.' });
+      const { password } = req.body;
+      // Accept a username OR a phone number as the identifier.
+      const identifier = req.body.username ?? req.body.phone;
+      if (!identifier || !password) {
+        return res.status(400).json({ error: 'Username/phone and password are required.' });
       }
-      const result = await loginUser(phone, password);
+      const result = await loginUser(identifier, password);
       console.log(`[auth] ✅ Login: ${result.username} (${result.role}) phone=${result.phone}`);
       res.json(result);
     } catch (err) {

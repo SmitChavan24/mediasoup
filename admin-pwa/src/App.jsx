@@ -264,7 +264,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          phone: formPhone.trim(),
+          username: formPhone.trim(), // field now holds username OR phone
           password: formPassword,
         }),
       });
@@ -447,7 +447,7 @@ function App() {
 
           {authMode === 'login' ? (
             <form onSubmit={handleLogin}>
-              <input type="tel" placeholder="Phone Number" value={formPhone} onChange={e => setFormPhone(e.target.value)} autoFocus required />
+              <input type="text" placeholder="Username or phone" value={formPhone} onChange={e => setFormPhone(e.target.value)} autoFocus required />
               <input type="password" placeholder="Password" value={formPassword} onChange={e => setFormPassword(e.target.value)} required />
               <button type="submit" disabled={authLoading}>{authLoading ? 'Signing in...' : 'Sign In'}</button>
             </form>

@@ -255,7 +255,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          phone: formPhone.trim(),
+          username: formPhone.trim(), // field now holds username OR phone
           password: formPassword,
         }),
       });
@@ -599,8 +599,8 @@ function App() {
           {/* Login only — agents are created by an admin, no self-registration. */}
           <form onSubmit={handleLogin}>
             <input
-              type="tel"
-              placeholder="Phone Number"
+              type="text"
+              placeholder="Username or phone"
               value={formPhone}
               onChange={e => setFormPhone(e.target.value)}
               autoFocus

@@ -82,25 +82,31 @@ async function registerUser(username, phone, password, role) {
  * Login with phone + password.
  * @returns {{ id, username, phone, role, token }}
  */
-async function loginUser(phone, password) {
+async function loginUser(identifier, password) {
   const pool = getPool();
 
-  const cleanPhone = validatePhone(phone);
+  const id = String(identifier || '').trim();
+  if (!id) throw new Error('Enter your username or phone.');
+
+  // Accept either a username or a phone number. validatePhone throws for a
+  // non-numeric username, so we fall back to a username-only match there.
+  let cleanPhone = null;
+  try { cleanPhone = validatePhone(id); } catch { cleanPhone = null; }
 
   const [rows] = await pool.execute(
-    'SELECT id, username, phone, password_hash, role FROM users WHERE phone = ?',
-    [cleanPhone]
+    'SELECT id, username, phone, password_hash, role FROM users WHERE username = ? OR phone = ? LIMIT 1',
+    [id, cleanPhone]
   );
 
   if (rows.length === 0) {
-    throw new Error('Invalid phone number or password.');
+    throw new Error('Invalid username/phone or password.');
   }
 
   const user = rows[0];
   const isMatch = await bcrypt.compare(password, user.password_hash);
 
   if (!isMatch) {
-    throw new Error('Invalid phone number or password.');
+    throw new Error('Invalid username/phone or password.');
   }
 
   // Update last_login
