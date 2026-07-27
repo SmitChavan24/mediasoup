@@ -1732,14 +1732,21 @@ async function main() {
   });
 
   // ── Auth REST endpoints ───────────────────────────────────────────────────
-  app.post('/api/register', async (req, res) => {
+  // Agents/admins are created ONLY by a logged-in admin — no self-registration.
+  // authMiddleware sets req.user from the Bearer token; we then require admin.
+  app.post('/api/register', authMiddleware, async (req, res) => {
     try {
-      const { username, phone, password, role } = req.body;
+      if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Only an admin can create accounts.' });
+      }
+      const { username, phone, password } = req.body;
+      let { role } = req.body;
       if (!username || !phone || !password || !role) {
         return res.status(400).json({ error: 'All fields are required: username, phone, password, role.' });
       }
+      if (!['agent', 'admin'].includes(role)) role = 'agent';
       const result = await registerUser(username, phone, password, role);
-      console.log(`[auth] ✅ Registered user: ${result.username} (${result.role}) phone=${result.phone}`);
+      console.log(`[auth] ✅ ${req.user.username} (admin) created ${result.role}: ${result.username} phone=${result.phone}`);
       res.json(result);
     } catch (err) {
       console.error(`[auth] ❌ Register failed:`, err.message);

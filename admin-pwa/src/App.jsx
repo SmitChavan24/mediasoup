@@ -76,6 +76,7 @@ function App() {
   const [formPhone, setFormPhone] = useState('');
   const [formPassword, setFormPassword] = useState('');
   const [formConfirmPassword, setFormConfirmPassword] = useState('');
+  const [addAgentMsg, setAddAgentMsg] = useState('');
 
   // App state
   const [socket, setSocket] = useState(null);
@@ -189,32 +190,34 @@ function App() {
     }
   };
 
-  const handleRegister = async (e) => {
+  // Admin creates an agent (authenticated with the admin's token). Does NOT
+  // switch the session — the admin stays logged in; the new agent then logs in
+  // on the agent panel with these credentials.
+  const handleAddAgent = async (e) => {
     e.preventDefault();
-    setAuthError('');
+    setAddAgentMsg('');
     if (formPassword !== formConfirmPassword) {
-      setAuthError('Passwords do not match.');
+      setAddAgentMsg('❌ Passwords do not match.');
       return;
     }
     setAuthLoading(true);
     try {
       const res = await fetch(`${SERVER_URL}/api/register`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.token}` },
         body: JSON.stringify({
           username: formUsername.trim(),
           phone: formPhone.trim(),
           password: formPassword,
-          role: 'admin',
+          role: 'agent',
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Registration failed');
-      const sess = { token: data.token, username: data.username, phone: data.phone, role: data.role };
-      storeSession(sess);
-      setSession(sess);
+      if (!res.ok) throw new Error(data.error || 'Failed to create agent');
+      setAddAgentMsg(`✅ Agent "${data.username}" created — they can now log in.`);
+      setFormUsername(''); setFormPhone(''); setFormPassword(''); setFormConfirmPassword('');
     } catch (err) {
-      setAuthError(err.message);
+      setAddAgentMsg('❌ ' + err.message);
     } finally {
       setAuthLoading(false);
     }
@@ -397,77 +400,29 @@ function App() {
           <h2>Admin Dashboard</h2>
           <p>Sign in with your phone number</p>
 
-          <div className="auth-tabs">
-            <button
-              className={`auth-tab ${authMode === 'login' ? 'active' : ''}`}
-              onClick={() => { setAuthMode('login'); setAuthError(''); }}
-            >Login</button>
-            <button
-              className={`auth-tab ${authMode === 'register' ? 'active' : ''}`}
-              onClick={() => { setAuthMode('register'); setAuthError(''); }}
-            >Register</button>
-          </div>
-
           {authError && <div className="auth-error">{authError}</div>}
 
-          {authMode === 'login' ? (
-            <form onSubmit={handleLogin}>
-              <input
-                type="tel"
-                placeholder="Phone Number"
-                value={formPhone}
-                onChange={e => setFormPhone(e.target.value)}
-                autoFocus
-                required
-              />
-              <input
-                type="password"
-                placeholder="Password"
-                value={formPassword}
-                onChange={e => setFormPassword(e.target.value)}
-                required
-              />
-              <button type="submit" disabled={authLoading}>
-                {authLoading ? 'Signing in...' : 'Sign In'}
-              </button>
-            </form>
-          ) : (
-            <form onSubmit={handleRegister}>
-              <input
-                type="text"
-                placeholder="Username"
-                value={formUsername}
-                onChange={e => setFormUsername(e.target.value)}
-                autoFocus
-                required
-              />
-              <input
-                type="tel"
-                placeholder="Phone Number"
-                value={formPhone}
-                onChange={e => setFormPhone(e.target.value)}
-                required
-              />
-              <input
-                type="password"
-                placeholder="Password (min 6 chars)"
-                value={formPassword}
-                onChange={e => setFormPassword(e.target.value)}
-                required
-                minLength={6}
-              />
-              <input
-                type="password"
-                placeholder="Confirm Password"
-                value={formConfirmPassword}
-                onChange={e => setFormConfirmPassword(e.target.value)}
-                required
-              />
-              <button type="submit" disabled={authLoading}>
-                {authLoading ? 'Creating Account...' : 'Create Account'}
-              </button>
-            </form>
-          )}
+          {/* Login only — no self-registration. */}
+          <form onSubmit={handleLogin}>
+            <input
+              type="tel"
+              placeholder="Phone Number"
+              value={formPhone}
+              onChange={e => setFormPhone(e.target.value)}
+              autoFocus
+              required
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={formPassword}
+              onChange={e => setFormPassword(e.target.value)}
+              required
+            />
+            <button type="submit" disabled={authLoading}>
+              {authLoading ? 'Signing in...' : 'Sign In'}
+            </button>
+          </form>
         </div>
       </div>
     );
@@ -497,6 +452,9 @@ function App() {
         </button>
         <button className={`admin-nav-btn ${currentView === 'history' ? 'active' : ''}`} onClick={() => setCurrentView('history')}>
           📋 Call History
+        </button>
+        <button className={`admin-nav-btn ${currentView === 'agents' ? 'active' : ''}`} onClick={() => { setCurrentView('agents'); setAddAgentMsg(''); }}>
+          👤 Add Agent
         </button>
       </nav>
 
@@ -737,6 +695,31 @@ function App() {
                 <button disabled={historyPage >= historyTotalPages} onClick={() => setHistoryPage(p => p + 1)}>Next →</button>
               </div>
             )}
+          </>
+        )}
+
+        {currentView === 'agents' && (
+          <>
+            <div className="history-header">
+              <h2 className="section-title">Add Agent</h2>
+            </div>
+            <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 13, margin: '0 0 16px' }}>
+              Create a new agent account. They'll sign in on the agent panel with the phone &amp; password you set here.
+            </p>
+            {addAgentMsg && (
+              <div style={{ margin: '0 0 14px', fontSize: 13, color: addAgentMsg.startsWith('✅') ? '#4ade80' : '#f87171' }}>
+                {addAgentMsg}
+              </div>
+            )}
+            <form onSubmit={handleAddAgent} style={{ display: 'flex', flexDirection: 'column', gap: 12, maxWidth: 380 }}>
+              <input className="filter-input" type="text" placeholder="Agent name" value={formUsername} onChange={e => setFormUsername(e.target.value)} required />
+              <input className="filter-input" type="tel" placeholder="Phone Number" value={formPhone} onChange={e => setFormPhone(e.target.value)} required />
+              <input className="filter-input" type="password" placeholder="Password (min 6 chars)" value={formPassword} onChange={e => setFormPassword(e.target.value)} required minLength={6} />
+              <input className="filter-input" type="password" placeholder="Confirm Password" value={formConfirmPassword} onChange={e => setFormConfirmPassword(e.target.value)} required />
+              <button className="btn-primary-sm" type="submit" disabled={authLoading}>
+                {authLoading ? 'Creating…' : 'Create Agent'}
+              </button>
+            </form>
           </>
         )}
       </main>

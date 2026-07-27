@@ -594,77 +594,29 @@ function App() {
           <h2>Agent Portal</h2>
           <p>Sign in with your phone number</p>
 
-          <div className="auth-tabs">
-            <button
-              className={`auth-tab ${authMode === 'login' ? 'active' : ''}`}
-              onClick={() => { setAuthMode('login'); setAuthError(''); }}
-            >Login</button>
-            <button
-              className={`auth-tab ${authMode === 'register' ? 'active' : ''}`}
-              onClick={() => { setAuthMode('register'); setAuthError(''); }}
-            >Register</button>
-          </div>
-
           {authError && <div className="auth-error">{authError}</div>}
 
-          {authMode === 'login' ? (
-            <form onSubmit={handleLogin}>
-              <input
-                type="tel"
-                placeholder="Phone Number"
-                value={formPhone}
-                onChange={e => setFormPhone(e.target.value)}
-                autoFocus
-                required
-              />
-              <input
-                type="password"
-                placeholder="Password"
-                value={formPassword}
-                onChange={e => setFormPassword(e.target.value)}
-                required
-              />
-              <button type="submit" disabled={authLoading}>
-                {authLoading ? 'Signing in...' : 'Sign In'}
-              </button>
-            </form>
-          ) : (
-            <form onSubmit={handleRegister}>
-              <input
-                type="text"
-                placeholder="Username"
-                value={formUsername}
-                onChange={e => setFormUsername(e.target.value)}
-                autoFocus
-                required
-              />
-              <input
-                type="tel"
-                placeholder="Phone Number"
-                value={formPhone}
-                onChange={e => setFormPhone(e.target.value)}
-                required
-              />
-              <input
-                type="password"
-                placeholder="Password (min 6 chars)"
-                value={formPassword}
-                onChange={e => setFormPassword(e.target.value)}
-                required
-                minLength={6}
-              />
-              <input
-                type="password"
-                placeholder="Confirm Password"
-                value={formConfirmPassword}
-                onChange={e => setFormConfirmPassword(e.target.value)}
-                required
-              />
-              <button type="submit" disabled={authLoading}>
-                {authLoading ? 'Creating Account...' : 'Create Account'}
-              </button>
-            </form>
-          )}
+          {/* Login only — agents are created by an admin, no self-registration. */}
+          <form onSubmit={handleLogin}>
+            <input
+              type="tel"
+              placeholder="Phone Number"
+              value={formPhone}
+              onChange={e => setFormPhone(e.target.value)}
+              autoFocus
+              required
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={formPassword}
+              onChange={e => setFormPassword(e.target.value)}
+              required
+            />
+            <button type="submit" disabled={authLoading}>
+              {authLoading ? 'Signing in...' : 'Sign In'}
+            </button>
+          </form>
         </div>
       </div>
     );
